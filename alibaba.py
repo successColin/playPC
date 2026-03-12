@@ -6,6 +6,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+import undetected_chromedriver as uc
 import time
 import random
 import sys
@@ -15,6 +16,7 @@ from datetime import datetime
 from urllib.parse import quote, urlparse
 from openpyxl import Workbook
 import argparse
+from multiprocessing import freeze_support
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -46,28 +48,22 @@ RESOLVE_REDIRECT_PATH = 'ci_bb'
 SPM_ANCHOR_PREFIX = 'a2615.'
 # 采集结果输出文件名前缀（运行时加上时间戳，如 data_20250307_143022.xlsx）
 OUTPUT_EXCEL_PREFIX = 'data'
-# 搜索关键词列表（每个关键词依次搜索，如 五金、模具）
-SEARCH_KEYWORDS_LIST = [
+# 搜索关键词列表默认值（用户可在运行时通过交互输入覆盖，多个关键词用逗号分隔）
+DEFAULT_SEARCH_KEYWORDS = [
     '机械设备', '精密加工', '五金工具', '工业耗材', '汽车配件', 'led照明', '家具',
     '家装建材', '塑料包装', '印刷', '健身器材', '户外园艺', '电子元器件', '传感器',
     '安防设备', '宠物用品', '原材料',
 ]
 # 搜索地区筛选：省份（如 广东、浙江），空字符串表示不按省份筛选
-TARGET_REGION = '广东'
+DEFAULT_TARGET_REGION = '广东'
 # 省份 -> 城市列表映射（按页面“从上到下、从左到右”顺序，一旦有就优先使用，不再从页面自动解析）
-PROVINCE_CITY_MAP = {
-    # 广东省（根据你截图中的顺序逐行展开）
-    '广东': [
-        '东莞'
-        # '广州', '惠州', '江门',
-        # '深圳', '汕头', '揭阳',
-        # '珠海', '汕尾', '茂名',
-        # '潮州', '韶关', '梅州',
-        # '中山', '湛江', '清远',
-        # '东莞', '肇庆', '阳江',
-        # '佛山', '河源', '云浮',
-    ],
+DEFAULT_PROVINCE_CITY_MAP = {
+    '广东': ['东莞'],
 }
+# 以下三个全局变量在 collectUserInput() 中根据用户交互输入赋值
+SEARCH_KEYWORDS_LIST = []
+TARGET_REGION = ''
+PROVINCE_CITY_MAP = {}
 # 每页抓取全部商家（不限制条数时用 0 或 None；正数时仅抓前 N 条，用于测试）
 MAX_FETCH_PER_PAGE = 0
 # Excel 表头（不含电话、传真；仅在有手机号时写入行），增加「当前城市」列
@@ -79,7 +75,10 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 # 本次运行最多采集的商家数量（0 或负数表示不限制，可通过命令行参数覆盖）
 DEFAULT_TOTAL_MAX_SHOPS = 0
 # 单个店铺最少采集用时（秒），用于整体控制抓取节奏，降低触发风控风险
-MIN_SECONDS_PER_SHOP = 10
+MIN_SECONDS_PER_SHOP = 15
+# 翻页间额外随机等待范围（秒），模拟人类浏览行为
+PAGE_TURN_WAIT_MIN = 3
+PAGE_TURN_WAIT_MAX = 7
 # 关闭已知弹窗的 JS 片段：仅在 baxia 弹窗不含滑块验证码时移除，避免误删用户需要手动完成的验证码弹窗
 JS_REMOVE_BAXIA_MASK = "var d=document.querySelector('.baxia-dialog');var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);var m=document.querySelector('.baxia-dialog-mask');if(m&&!c)m.remove();"
 JS_REMOVE_BAXIA_DIALOG = "var d=document.querySelector('.baxia-dialog');var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);if(d&&!c)d.remove();"
@@ -87,6 +86,9 @@ JS_REMOVE_BAXIA_DIALOG = "var d=document.querySelector('.baxia-dialog');var c=d&
 TEXT_ACCESS_DENIED = '访问被拒绝'
 # 访问被拒绝弹窗最大尝试关闭次数（避免死循环）
 MAX_ACCESS_DENIED_CLOSE_ATTEMPTS = 3
+# 触发「访问被拒绝」后的冷却等待时间范围（秒），降低后续请求被连续拦截的概率
+ACCESS_DENIED_COOLDOWN_MIN = 15
+ACCESS_DENIED_COOLDOWN_MAX = 30
 # ── 滑块自动拖拽相关常量 ──────────────────────────────────
 # 滑块按钮选择器列表（按优先级排列，匹配 1688 baxia NoCaptcha 常见结构）
 SLIDER_BTN_SELECTORS = [
@@ -177,6 +179,86 @@ def loadRuntimeConfig():
     TOTAL_MAX_SHOPS = args.max_shops if args.max_shops >= 0 else DEFAULT_TOTAL_MAX_SHOPS
 
 
+def collectUserInput():
+    """
+    交互式收集用户输入：搜索关键词、目标省份、指定城市。
+    直接回车则使用默认值；输入内容用中文逗号或英文逗号分隔。
+    """
+    global SEARCH_KEYWORDS_LIST, TARGET_REGION, PROVINCE_CITY_MAP
+
+    print('=' * 60)
+    print('  1688 商家采集工具 - 参数配置')
+    print('=' * 60)
+    print()
+
+    # ── 输入搜索关键词 ──
+    default_kw_str = '、'.join(DEFAULT_SEARCH_KEYWORDS)
+    print(f'当前默认关键词（共 {len(DEFAULT_SEARCH_KEYWORDS)} 个）:')
+    print(f'  {default_kw_str}')
+    print()
+    kw_input = input('请输入搜索关键词（多个用逗号分隔，直接回车使用默认值）: ').strip()
+    if kw_input:
+        # 同时支持中文逗号「，」和英文逗号「,」以及中文顿号「、」作为分隔符
+        raw_list = re.split(r'[,，、]+', kw_input)
+        SEARCH_KEYWORDS_LIST = [kw.strip() for kw in raw_list if kw.strip()]
+    else:
+        SEARCH_KEYWORDS_LIST = list(DEFAULT_SEARCH_KEYWORDS)
+    print(f'  → 本次关键词（{len(SEARCH_KEYWORDS_LIST)} 个）: {SEARCH_KEYWORDS_LIST}')
+    print()
+
+    # ── 输入目标省份 ──
+    print(f'当前默认省份: {DEFAULT_TARGET_REGION or "（不限省份）"}')
+    region_input = input('请输入目标省份（如 广东、浙江，留空表示不限省份，直接回车使用默认值）: ').strip()
+    if region_input:
+        TARGET_REGION = region_input
+    elif region_input == '':
+        # 用户直接回车 → 使用默认值；若想清空省份需输入特殊标记
+        TARGET_REGION = DEFAULT_TARGET_REGION
+    print(f'  → 本次省份: {TARGET_REGION or "（不限省份，全国范围）"}')
+    print()
+
+    # ── 输入指定城市 ──
+    default_cities = DEFAULT_PROVINCE_CITY_MAP.get(TARGET_REGION, [])
+    if default_cities:
+        print(f'当前默认城市: {", ".join(default_cities)}')
+    else:
+        print('当前无预置城市（将自动从页面解析）')
+    city_input = input(
+        '请输入指定城市（多个用逗号分隔，留空表示自动解析全省城市，直接回车使用默认值）: '
+    ).strip()
+    if city_input:
+        raw_cities = re.split(r'[,，、]+', city_input)
+        user_cities = [c.strip() for c in raw_cities if c.strip()]
+        if user_cities and TARGET_REGION:
+            PROVINCE_CITY_MAP = {TARGET_REGION: user_cities}
+        elif user_cities:
+            PROVINCE_CITY_MAP = {}
+    elif city_input == '' and default_cities:
+        # 用户直接回车 → 使用默认值
+        PROVINCE_CITY_MAP = dict(DEFAULT_PROVINCE_CITY_MAP)
+    else:
+        PROVINCE_CITY_MAP = {}
+
+    final_cities = PROVINCE_CITY_MAP.get(TARGET_REGION, [])
+    if final_cities:
+        print(f'  → 本次城市: {", ".join(final_cities)}')
+    else:
+        print(f'  → 本次城市: （自动从页面解析全省城市列表）')
+
+    print()
+    print('=' * 60)
+    print(f'  关键词: {SEARCH_KEYWORDS_LIST}')
+    print(f'  省份:   {TARGET_REGION or "不限"}')
+    print(f'  城市:   {final_cities or "自动解析"}')
+    print('=' * 60)
+    print()
+    confirm = input('确认以上配置并开始采集？（回车确认 / 输入 n 退出）: ').strip().lower()
+    if confirm in ('n', 'no', '否'):
+        print('已取消，程序退出。')
+        sys.exit(0)
+    print()
+
+
 def getShopOrigin(shop_url):
     """
     从任意店铺 URL 解析出「协议 + 域名」，用于拼接 /page/contactinfo.htm。
@@ -211,25 +293,25 @@ def closeKnownPopups(driver):
 def closeAccessDeniedPopup(driver):
     """
     检测并尝试关闭「亲，访问被拒绝」弹窗（1688 风控提示）。
-    若页面存在该文案，则尝试点击关闭按钮或移除弹窗 DOM，便于继续抓取。
-    返回 True 表示曾检测到并已尝试关闭，False 表示未发现该弹窗。
+    若页面存在该文案，则尝试点击关闭按钮或移除弹窗 DOM。
+    关闭后会进行冷却等待（避免连续请求再次触发风控），然后刷新页面尝试恢复。
+    返回 True 表示曾检测到并已尝试处理，False 表示未发现该弹窗。
     """
     try:
         body_text = (driver.find_element(By.TAG_NAME, 'body').text or '')
         if TEXT_ACCESS_DENIED not in body_text:
             return False
-        # 尝试多种方式关闭：先找关闭按钮点击，再尝试移除弹窗容器
+
+        print(f'  ⚠ 检测到「访问被拒绝」弹窗，进入冷却等待以降低风控风险...')
         closed = False
         for _ in range(MAX_ACCESS_DENIED_CLOSE_ATTEMPTS):
             try:
-                # 方式1：通过包含「访问被拒绝」的文案找到弹窗，再找其内的关闭按钮（常见为 × 或 class 含 close）
                 deny_els = driver.find_elements(
                     By.XPATH,
                     "//*[contains(text(),'" + TEXT_ACCESS_DENIED + "')]"
                 )
                 for el in deny_els:
                     try:
-                        # 在弹窗容器内找关闭按钮：同一父级下的 button 或 a 或 span（文案为 × 或 关闭）
                         parent = el.find_element(
                             By.XPATH,
                             "./ancestor::*[contains(@class,'dialog') or contains(@class,'modal') or contains(@class,'popup')][1]"
@@ -247,7 +329,6 @@ def closeAccessDeniedPopup(driver):
                         pass
                 if closed:
                     break
-                # 方式2：用 JS 移除包含「访问被拒绝」的弹窗及其遮罩（通过常见 class 或标签）
                 script = """
                 var text = '""" + TEXT_ACCESS_DENIED + """';
                 var all = document.querySelectorAll('div, section');
@@ -267,9 +348,17 @@ def closeAccessDeniedPopup(driver):
             except Exception:
                 pass
             time.sleep(0.5)
-        if closed:
-            time.sleep(1)
-        return closed
+
+        # 不论弹窗是否成功关闭，都进行冷却等待再刷新，避免连续请求被再次拦截
+        cooldown = random.uniform(ACCESS_DENIED_COOLDOWN_MIN, ACCESS_DENIED_COOLDOWN_MAX)
+        print(f'  → 冷却等待 {cooldown:.0f} 秒后刷新页面...')
+        time.sleep(cooldown)
+        try:
+            driver.refresh()
+            time.sleep(random.uniform(3, 5))
+        except Exception:
+            pass
+        return True
     except Exception:
         return False
 
@@ -479,33 +568,41 @@ def extractContactByRegex(page_text):
     return (member_name or '', tel or '', mobile or '', fax or '', address or '')
 
 
-# 创建浏览器驱动：优先 Chrome（兼容性与速度更好），不可用时使用 Firefox
-# 注入反检测配置，避免 1688 等站点通过 navigator.webdriver 等特征识别自动化浏览器
+# 创建浏览器驱动：优先使用 undetected-chromedriver（从底层 patch Chrome 二进制以绕过反自动化检测），
+# 不可用时退化到普通 Selenium Chrome + 手动反检测配置，最后兜底 Firefox
 def createBrowserDriver():
     """
-    优先创建 Chrome 驱动（含反自动化检测配置），失败则使用 Firefox。
-    反检测措施包括：禁用 AutomationControlled 特征、移除 navigator.webdriver 标记、
-    伪装 window.chrome 对象等，使浏览器行为接近真实用户操作。
+    优先使用 undetected-chromedriver 创建浏览器实例，从底层 patch chromedriver 二进制，
+    彻底规避 navigator.webdriver / $cdc_ 变量等自动化指纹检测。
+    若 uc 不可用则依次退化到普通 Selenium Chrome（含手动反检测配置）和 Firefox。
     """
+    # 方案1（推荐）：undetected-chromedriver —— 底层 patch，反检测效果最好
+    try:
+        options = uc.ChromeOptions()
+        # 禁用 Blink 引擎的 AutomationControlled 特征（uc 已内置处理，这里双重保险）
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        # 设置中文语言环境，与真实用户一致
+        options.add_argument('--lang=zh-CN')
+        driver = uc.Chrome(options=options)
+        print('使用浏览器: Chrome（undetected-chromedriver，已启用底层反检测）')
+        return driver
+    except Exception as e_uc:
+        print(f'undetected-chromedriver 启动失败: {str(e_uc)[:80]}，尝试普通 Chrome...')
+
+    # 方案2（退化）：普通 Selenium Chrome + 手动反检测配置
     try:
         options = webdriver.ChromeOptions()
-        # 禁用 Blink 引擎的 AutomationControlled 特征（最关键的一步）
         options.add_argument('--disable-blink-features=AutomationControlled')
-        # 去掉「Chrome 正受到自动测试软件的控制」信息栏
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
-        # 禁用 AutomationExtension，减少指纹暴露
         options.add_experimental_option('useAutomationExtension', False)
         driver = webdriver.Chrome(options=options)
-        # 通过 CDP 命令在每个新页面加载前注入脚本，覆盖 navigator.webdriver 等可检测属性
         driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            // 伪装 window.chrome 对象（部分网站会检测该对象是否存在）
             if (!window.chrome) {
                 window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
             }
-            // 覆盖 Permissions API 的查询方法，避免返回 "denied" 暴露自动化特征
             const originalQuery = window.navigator.permissions.query;
             window.navigator.permissions.query = (parameters) => (
                 parameters.name === 'notifications'
@@ -513,15 +610,20 @@ def createBrowserDriver():
                     : originalQuery(parameters)
             );
         """})
-        print('使用浏览器: Chrome（已启用反检测配置）')
+        print('使用浏览器: Chrome（普通 Selenium + 手动反检测配置）')
         return driver
-    except Exception as e1:
-        try:
-            driver = webdriver.Firefox()
-            print('使用浏览器: Firefox (Chrome 不可用:', str(e1)[:50], ')')
-            return driver
-        except Exception as e2:
-            raise RuntimeError(f'Chrome 与 Firefox 均不可用。Chrome: {e1}; Firefox: {e2}') from e2
+    except Exception as e_chrome:
+        print(f'普通 Chrome 也不可用: {str(e_chrome)[:50]}，尝试 Firefox...')
+
+    # 方案3（兜底）：Firefox
+    try:
+        driver = webdriver.Firefox()
+        print('使用浏览器: Firefox（兜底方案）')
+        return driver
+    except Exception as e_ff:
+        raise RuntimeError(
+            f'所有浏览器均不可用。uc: {e_uc}; Chrome: {e_chrome}; Firefox: {e_ff}'
+        ) from e_ff
 
 
 def buildOutputFileName():
@@ -1073,8 +1175,12 @@ def getCityListByProvince(driver, province_name, keyword):
     return city_list
 
 
-# 先加载运行参数，再创建浏览器驱动
+# Windows 下 PyInstaller 打包后需要调用 freeze_support 防止多进程异常
+freeze_support()
+
+# 先加载运行参数，再收集用户交互输入，最后创建浏览器驱动
 loadRuntimeConfig()
+collectUserInput()
 driver = createBrowserDriver()
 wait = WebDriverWait(driver, 120)
 
@@ -1459,7 +1565,7 @@ for task_idx, (current_city, current_keyword) in enumerate(task_queue, start=1):
                             time.sleep(extra_sleep)
                     else:
                         print('  无手机号，跳过写入 Excel')
-                        time.sleep(random.uniform(2, 3))
+                        time.sleep(random.uniform(3, 6))
                     # 关闭联系方式页标签，切回主标签（搜索结果页），继续本页下一个或翻页
                     driver.close()
                     driver.switch_to.window(main_window)
@@ -1489,16 +1595,16 @@ for task_idx, (current_city, current_keyword) in enumerate(task_queue, start=1):
                     break
             except Exception:
                 pass
-            # 有下一页时才滚动并点击下一页，避免无谓等待
-            time.sleep(2)
+            # 有下一页时才滚动并点击下一页，翻页前后加入随机等待以降低风控触发概率
+            time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
             scrollToBottom(driver)
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
             try:
                 closeKnownPopups(driver)
             except Exception:
                 pass
             driver.execute_script("arguments[0].click();", next_btn)
-            time.sleep(3)
+            time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
             page_num += 1
         except Exception as e:
             print('error:', e)
