@@ -24,7 +24,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 import undetected_chromedriver as uc
 
+# 统一 stdin/stdout 为 UTF-8，避免 Windows 下粘贴中文乱码或无法输入
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stdin, 'buffer'):
+    sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
 
 # ── 联系信息提取相关常量 ─────────────────────────────────
 LABEL_CONTACT = '联系人'
@@ -65,15 +68,43 @@ DEFAULT_PROVINCE_CITY_MAP: dict[str, list[str]] = {
 MAX_FETCH_PER_PAGE = 0
 EXCEL_HEADERS = ('企业名称', '关键词', '当前城市', '联系方式', '联系人', '手机', '地址')
 
+VERBOSE_LOG = False
+
+
+def logVerbose(message: str) -> None:
+    """详细日志输出：仅在 VERBOSE_LOG 为 True 时打印。"""
+    if VERBOSE_LOG:
+        print(message)
+
 # ── 运行参数默认值 ───────────────────────────────────────
 DEFAULT_CAPTCHA_WAIT_TIMEOUT = 60
 DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
-# ── 节奏控制 ────────────────────────────────────────────
+# ── 节奏控制（反爬：随机化、冷却）────────────────────────
 MIN_SECONDS_PER_SHOP = 15
+MIN_SECONDS_PER_SHOP_JITTER = 2  # 单条采集耗时在 MIN ± JITTER 内随机
 PAGE_TURN_WAIT_MIN = 3
 PAGE_TURN_WAIT_MAX = 7
+# 任务切换：每个新任务开始前随机等待，避免连续请求
+TASK_START_DELAY_MIN = 2
+TASK_START_DELAY_MAX = 6
+# 打开新页面/新标签后等待，模拟用户阅读
+PAGE_OPEN_DELAY_MIN = 1
+PAGE_OPEN_DELAY_MAX = 3
+# 无手机号时仍保持一定间隔，避免空结果也高频请求
+SHOP_NO_MOBILE_WAIT_MIN = 3
+SHOP_NO_MOBILE_WAIT_MAX = 6
+# 每采集 N 个商家后休息一段时间，降低连续请求特征
+REST_EVERY_N_SHOPS = 8
+REST_DURATION_MIN = 25
+REST_DURATION_MAX = 45
+# 访问被拒/验证码通过后的“恢复期”额外等待
+RECOVERY_AFTER_DENIED_EXTRA_MIN = 5
+RECOVERY_AFTER_DENIED_EXTRA_MAX = 12
+# 登录后建立 1688 会话的等待
+LOGIN_TO_1688_WAIT_MIN = 3
+LOGIN_TO_1688_WAIT_MAX = 6
 
 # ── 弹窗处理 JS ────────────────────────────────────────
 JS_REMOVE_BAXIA_MASK = (
@@ -127,9 +158,11 @@ SLIDER_MAX_RETRY = 3
 SLIDER_STEP_MIN_MS = 8
 SLIDER_STEP_MAX_MS = 25
 
-# ── 滚动加载常量 ────────────────────────────────────────
+# ── 滚动加载常量（反爬：随机化步长与间隔）────────────────
 SCROLL_STEP_PX = 600
-SCROLL_STEP_WAIT = 0.5
+SCROLL_STEP_PX_JITTER = 80   # 每步滚动量 ±jitter 随机
+SCROLL_STEP_WAIT_MIN = 0.4
+SCROLL_STEP_WAIT_MAX = 0.9
 SCROLL_FINAL_WAIT = 1.5
 EXPECTED_ITEMS_PER_PAGE = 20
 
@@ -269,6 +302,18 @@ def extractContactByRegex(page_text: str) -> tuple[str, str, str, str, str]:
     return (member_name, tel, mobile, fax, address)
 
 
+def randomDelay(min_sec: float, max_sec: float) -> None:
+    """
+    反爬：在 [min_sec, max_sec] 内随机休眠，统一人性化延迟。
+    避免固定间隔被识别为脚本。
+    """
+    if max_sec <= 0:
+        return
+    delay = random.uniform(max(0, min_sec), max_sec)
+    if delay > 0:
+        time.sleep(delay)
+
+
 # ═══════════════════════════════════════════════════════════
 #  配置加载与用户交互（在创建 Scraper 前调用）
 # ═══════════════════════════════════════════════════════════
@@ -299,11 +344,6 @@ def loadRuntimeConfig() -> ScraperConfig:
 
 def collectUserInput(config: ScraperConfig) -> ScraperConfig:
     """交互式收集用户输入：搜索关键词、目标省份、指定城市。直接回车使用默认值。"""
-    print('=' * 60)
-    print('  1688 商家采集工具 - 参数配置')
-    print('=' * 60)
-    print()
-
     # ── 输入搜索关键词 ──
     default_kw_str = '、'.join(DEFAULT_SEARCH_KEYWORDS)
     print(f'当前默认关键词（共 {len(DEFAULT_SEARCH_KEYWORDS)} 个）:')
@@ -385,6 +425,8 @@ class AlibabaScraper:
         self.seen_shops: set[str] = set()
         self.total_collected = 0
         self._stop = False
+        # 反爬：访问被拒/验证码后的恢复期，下一批操作延长等待
+        self._recovery_until: float = 0
 
     # ── 生命周期 ──────────────────────────────────────────
 
@@ -417,13 +459,21 @@ class AlibabaScraper:
         """
         优先使用 undetected-chromedriver 创建浏览器实例（底层 patch 反检测），
         不可用时依次退化到普通 Selenium Chrome、Firefox。
+        反爬：禁用自动化特征、设置常见窗口尺寸、注入反检测脚本。
         """
+        # 常见窗口尺寸（反爬：避免无头/默认尺寸被识别）
+        width = random.randint(1280, 1440)
+        height = random.randint(720, 900)
+
         # 方案 1：undetected-chromedriver（推荐）
         try:
             options = uc.ChromeOptions()
             options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_argument('--lang=zh-CN')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--no-sandbox')
             self.driver = uc.Chrome(options=options)
+            self.driver.set_window_size(width, height)
             self.wait = WebDriverWait(self.driver, LOGIN_WAIT_TIMEOUT)
             return
         except Exception as e_uc:
@@ -433,9 +483,11 @@ class AlibabaScraper:
         try:
             options = webdriver.ChromeOptions()
             options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
             options.add_experimental_option('useAutomationExtension', False)
             self.driver = webdriver.Chrome(options=options)
+            self.driver.set_window_size(width, height)
+            # 反爬：注入反检测脚本，隐藏 webdriver、统一语言与插件特征
             self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
@@ -458,6 +510,7 @@ class AlibabaScraper:
         # 方案 3：Firefox 兜底
         try:
             self.driver = webdriver.Firefox()
+            self.driver.set_window_size(width, height)
             self.wait = WebDriverWait(self.driver, LOGIN_WAIT_TIMEOUT)
         except Exception as e_ff:
             raise RuntimeError(f'所有浏览器均不可用: {e_ff}') from e_ff
@@ -487,11 +540,8 @@ class AlibabaScraper:
             else:
                 print('✗ 登录超时，请重新运行脚本并及时扫码')
                 raise SystemExit(1)
-
-        print('正在建立 1688 会话...')
         self.driver.get('https://www.1688.com/')
-        time.sleep(random.uniform(3, 5))
-        print('1688 会话已建立')
+        randomDelay(LOGIN_TO_1688_WAIT_MIN, LOGIN_TO_1688_WAIT_MAX)
 
     # ── 主采集入口 ────────────────────────────────────────
 
@@ -538,7 +588,7 @@ class AlibabaScraper:
         # 优先使用预置城市列表
         preset = self.config.province_city_map.get(province_name)
         if preset:
-            print(f'省份「{province_name}」使用预置城市列表: {preset}')
+            logVerbose(f'省份「{province_name}」使用预置城市列表: {preset}')
             return list(preset)
 
         city_list: list[str] = []
@@ -648,11 +698,14 @@ class AlibabaScraper:
     def _processTask(self, task_idx: int, total_tasks: int, city: str, keyword: str):
         """处理单个（城市, 关键词）任务：逐页采集直到无下一页或达到上限。"""
         city_desc = city or '整省/全国'
-        print('━' * 50)
-        print(f'任务 [{task_idx}/{total_tasks}] 关键词「{keyword}」城市「{city_desc}」')
+        logVerbose('━' * 50)
+        logVerbose(f'任务 [{task_idx}/{total_tasks}] 关键词「{keyword}」城市「{city_desc}」')
 
+        # 反爬：新任务开始前随机等待，避免连续请求
+        randomDelay(TASK_START_DELAY_MIN, TASK_START_DELAY_MAX)
         search_url = buildSearchUrl(keyword, self.config.target_region, city)
         self.driver.get(search_url)
+        randomDelay(PAGE_OPEN_DELAY_MIN, PAGE_OPEN_DELAY_MAX)
 
         main_window = self.driver.current_window_handle
         page_error_count = 0
@@ -686,6 +739,7 @@ class AlibabaScraper:
         返回 True 表示可继续翻页，False 表示应终止当前任务。
         """
         city_desc = city or '整省/全国'
+        self._maybeRecoveryWait()
         self._closeKnownPopups()
         if self._closeAccessDeniedPopup():
             print('检测到「访问被拒绝」弹窗，已尝试关闭')
@@ -705,7 +759,7 @@ class AlibabaScraper:
             self._logEmptyPage(page_num)
             return False
 
-        print(f'关键词「{keyword}」城市「{city_desc}」第 {page_num} 页找到 {len(titles)} 个商家')
+        logVerbose(f'关键词「{keyword}」城市「{city_desc}」第 {page_num} 页找到 {len(titles)} 个商家')
 
         # 检查是否已到末页
         if self._isLastPage(keyword, city_desc, page_num):
@@ -769,9 +823,9 @@ class AlibabaScraper:
                     total_pages = int(m.group(1))
 
             if total_pages > 0:
-                print(f'关键词「{keyword}」城市「{city_desc}」搜索结果共 {total_pages} 页')
+                logVerbose(f'关键词「{keyword}」城市「{city_desc}」搜索结果共 {total_pages} 页')
                 if page_num >= total_pages:
-                    print(f'已达末页（第 {page_num}/{total_pages} 页），结束该任务')
+                    logVerbose(f'已达末页（第 {page_num}/{total_pages} 页），结束该任务')
                     return True
         except Exception:
             pass
@@ -784,6 +838,7 @@ class AlibabaScraper:
         keyword: str, city: str, main_window: str,
     ):
         """在新标签中打开商家联系页，提取联系信息，写入 Excel。"""
+        self._maybeRecoveryWait()
         shop_start = time.time()
         href = (href_value or '').strip()
         is_redirect = (RESOLVE_REDIRECT_HOST in href) or (RESOLVE_REDIRECT_PATH in href)
@@ -795,7 +850,7 @@ class AlibabaScraper:
 
             dedup_key = shop_origin or href or title_value
             if dedup_key in self.seen_shops:
-                print(f'  跳过重复店铺（已采集）: {title_value}')
+                logVerbose(f'  跳过重复店铺（已采集）: {title_value}')
                 self._closeTabAndReturn(main_window)
                 return
             self.seen_shops.add(dedup_key)
@@ -815,6 +870,8 @@ class AlibabaScraper:
 
             if waited > 0:
                 print('验证通过，刷新页面重新获取联系数据...')
+                # 反爬：验证码通过后短暂恢复期，降低紧接着的请求频率
+                self._recovery_until = time.time() + random.uniform(3, 8)
                 page_text = self._refreshAndGetText(page_text)
 
             # 提取联系信息（DOM 优先，正则兜底）
@@ -824,11 +881,16 @@ class AlibabaScraper:
             if mobile_stripped:
                 self._writeToExcel(title_value, keyword, city, contact_url, contact)
                 self.total_collected += 1
-                print(f'已累计写入 {self.total_collected} 条数据')
+                print(f'已累计写入 {self.total_collected} 条数据', flush=True)
                 self._checkCollectLimit()
+                # 反爬：每采集 N 个商家后休息一段时间
+                if REST_EVERY_N_SHOPS > 0 and self.total_collected % REST_EVERY_N_SHOPS == 0:
+                    rest_sec = random.uniform(REST_DURATION_MIN, REST_DURATION_MAX)
+                    logVerbose(f'已采集 {self.total_collected} 条，休息 {rest_sec:.0f} 秒...')
+                    time.sleep(rest_sec)
                 self._throttle(shop_start)
             else:
-                time.sleep(random.uniform(3, 6))
+                randomDelay(SHOP_NO_MOBILE_WAIT_MIN, SHOP_NO_MOBILE_WAIT_MAX)
 
             self.driver.close()
             self.driver.switch_to.window(main_window)
@@ -852,10 +914,12 @@ class AlibabaScraper:
             contact_url = shop_origin.rstrip('/') + '/page/contactinfo.htm'
             self.driver.execute_script("window.open(arguments[0], '_blank');", contact_url)
             self.driver.switch_to.window(self.driver.window_handles[-1])
+            randomDelay(PAGE_OPEN_DELAY_MIN, PAGE_OPEN_DELAY_MAX)
             self._closeKnownPopups()
         else:
             self.driver.execute_script("window.open(arguments[0], '_blank');", href)
             self.driver.switch_to.window(self.driver.window_handles[-1])
+            randomDelay(PAGE_OPEN_DELAY_MIN, PAGE_OPEN_DELAY_MAX)
             self._closeKnownPopups()
             shop_origin = getShopOrigin((self.driver.current_url or '').strip())
             if not shop_origin:
@@ -949,10 +1013,21 @@ class AlibabaScraper:
             print(f'已达采集上限 {self.config.total_max_shops}，停止后续采集')
             self._stop = True
 
+    def _maybeRecoveryWait(self) -> None:
+        """反爬：若处于访问被拒/验证码后的恢复期，额外等待再继续。"""
+        if time.time() < self._recovery_until:
+            extra = self._recovery_until - time.time()
+            if extra > 0:
+                print(f'恢复期等待 {extra:.0f} 秒...')
+                time.sleep(extra)
+            self._recovery_until = 0
+
     def _throttle(self, shop_start: float):
         """控制单条采集最少耗时，降低触发风控的概率。"""
         elapsed = time.time() - shop_start
-        target = MIN_SECONDS_PER_SHOP + random.uniform(-2, 2)
+        target = MIN_SECONDS_PER_SHOP + random.uniform(
+            -MIN_SECONDS_PER_SHOP_JITTER, MIN_SECONDS_PER_SHOP_JITTER
+        )
         target = max(target, MIN_SECONDS_PER_SHOP * 0.8)
         extra = max(0, target - elapsed)
         if extra > 0:
@@ -978,12 +1053,12 @@ class AlibabaScraper:
         except Exception:
             pass
 
-        time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
+        randomDelay(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX)
         self._scrollToBottom()
-        time.sleep(random.uniform(2, 4))
+        randomDelay(PAGE_OPEN_DELAY_MAX, PAGE_OPEN_DELAY_MAX + 1)
         self._closeKnownPopups()
         self.driver.execute_script('arguments[0].click();', next_btn)
-        time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
+        randomDelay(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX)
         return True
 
     # ── DOM 联系信息提取 ──────────────────────────────────
@@ -1215,9 +1290,13 @@ class AlibabaScraper:
             time.sleep(cooldown)
             try:
                 self.driver.refresh()
-                time.sleep(random.uniform(3, 5))
+                randomDelay(PAGE_OPEN_DELAY_MIN + 2, PAGE_OPEN_DELAY_MAX + 3)
             except Exception:
                 pass
+            # 反爬：进入恢复期，后续几次操作延长等待
+            self._recovery_until = time.time() + random.uniform(
+                RECOVERY_AFTER_DENIED_EXTRA_MIN, RECOVERY_AFTER_DENIED_EXTRA_MAX
+            )
             return True
         except Exception:
             return False
@@ -1314,7 +1393,7 @@ class AlibabaScraper:
             distance = self._calcSliderDistance(slider, track)
             jitter = random.randint(-10, 10)
             distance = max(100, distance + jitter)
-            print(f'自动拖拽滑块（第 {attempt + 1} 次，距离 {distance}px）')
+            logVerbose(f'自动拖拽滑块（第 {attempt + 1} 次，距离 {distance}px）')
 
             try:
                 self._humanLikeDrag(slider, distance)
@@ -1327,13 +1406,13 @@ class AlibabaScraper:
                 except Exception:
                     pass
 
-            time.sleep(random.uniform(1.5, 3.0))
+            randomDelay(1.5, 3.0)
 
             if not self._detectCaptcha():
                 print('自动拖拽验证通过！')
                 return True
 
-            time.sleep(random.uniform(2.0, 4.0))
+            randomDelay(2.0, 4.0)
             self._clickSliderRefresh()
 
         return False
@@ -1354,7 +1433,7 @@ class AlibabaScraper:
             ])
             if btn:
                 btn.click()
-                time.sleep(random.uniform(1.0, 2.0))
+                randomDelay(1.0, 2.0)
         except Exception:
             pass
 
@@ -1461,9 +1540,13 @@ class AlibabaScraper:
             current_pos = 0
 
             while current_pos < total_height:
-                current_pos += SCROLL_STEP_PX
+                step = SCROLL_STEP_PX + random.randint(
+                    -SCROLL_STEP_PX_JITTER, SCROLL_STEP_PX_JITTER
+                )
+                step = max(200, step)
+                current_pos += step
                 self.driver.execute_script(f'window.scrollTo(0, {current_pos});')
-                time.sleep(SCROLL_STEP_WAIT)
+                randomDelay(SCROLL_STEP_WAIT_MIN, SCROLL_STEP_WAIT_MAX)
 
                 try:
                     loaded = len(self.driver.find_elements(By.CSS_SELECTOR, 'a.company-name'))
@@ -1510,7 +1593,7 @@ class AlibabaScraper:
     def _closeTabAndReturn(self, main_window: str):
         """关闭当前标签并切回主窗口。"""
         try:
-            time.sleep(random.uniform(2, 3))
+            randomDelay(2, 3)
             self.driver.close()
             self.driver.switch_to.window(main_window)
         except Exception:
@@ -1519,7 +1602,7 @@ class AlibabaScraper:
     def _safeCloseAndReturn(self, main_window: str):
         """安全关闭非主窗口标签并切回主窗口（异常恢复用）。"""
         try:
-            time.sleep(random.uniform(2, 3))
+            randomDelay(2, 3)
             if self.driver.current_window_handle != main_window:
                 self.driver.close()
             self.driver.switch_to.window(main_window)
