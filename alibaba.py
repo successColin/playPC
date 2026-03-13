@@ -1,96 +1,98 @@
 #! /usr/bin/env python
 # coding:utf-8
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-import undetected_chromedriver as uc
-import time
-import random
-import sys
-import io
-import re
-from datetime import datetime
-from urllib.parse import quote, urlparse
-from openpyxl import Workbook
+from __future__ import annotations
+
 import argparse
+import io
+import random
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from multiprocessing import freeze_support
+from typing import Optional
+from urllib.parse import quote, urlparse
+
+from openpyxl import Workbook
+from selenium import webdriver
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+import undetected_chromedriver as uc
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # ── 联系信息提取相关常量 ─────────────────────────────────
-# 联系方式页内用于 DOM 提取的标签关键词（与 1688 常见结构一致）
 LABEL_CONTACT = '联系人'
 LABEL_TEL = '电话'
 LABEL_MOBILE = '手机'
 LABEL_FAX = '传真'
 LABEL_ADDRESS = '地址'
-# 联系人正则：先匹配「联系人：xxx」，再匹配「xxx先生/女士/经理」等形式
+
 PATTERN_CONTACT_LABEL = re.compile(r'联系人[：:]\s*([^\n]{1,20})')
 PATTERN_CONTACT_SUFFIX = re.compile(r'([\u4e00-\u9fa5]{2,5})(?:先生|女士|经理|总监|总裁|老板)')
-# 电话/手机/传真正则：仅保留数字、横线、空格
 PATTERN_TEL = re.compile(r'电话[：:]\s*([0-9\-\u00a0\s]+)')
 PATTERN_MOBILE = re.compile(r'手机[：:]\s*([0-9\-\u00a0\s]+)')
 PATTERN_FAX = re.compile(r'传真[：:]\s*([0-9\-\u00a0\s]+)')
-# 地址正则：到行末或遇到常见下一字段关键词为止（含「技术支持」避免抓成地址）
-PATTERN_ADDRESS = re.compile(r'地址[：:]\s*([^\n]+?)(?=\s*$|邮编|传真|公司名称|邮箱|联系人|电话|手机|技术支持)', re.DOTALL)
+PATTERN_ADDRESS = re.compile(
+    r'地址[：:]\s*([^\n]+?)(?=\s*$|邮编|传真|公司名称|邮箱|联系人|电话|手机|技术支持)',
+    re.DOTALL,
+)
 PATTERN_ADDRESS_SIMPLE = re.compile(r'地址[：:]\s*([^\n]+)')
-# 地址中需剔除的后缀（如「技术支持:旺铺管理」）
 PATTERN_ADDRESS_NOISE = re.compile(r'\s*技术支持[：:][^\n]*$')
-# 地址最大保留长度
+
 MAX_ADDRESS_LEN = 200
-# 搜索页公司链接若为此域名/路径则为跳转链接，需先访问取真实店铺 URL
+
+# ── 搜索与分页常量 ──────────────────────────────────────
 RESOLVE_REDIRECT_HOST = 'dj.1688.com'
 RESOLVE_REDIRECT_PATH = 'ci_bb'
-# 1688 联系块 data-spm 容器特征（你提供的结构：电话/手机/传真/地址 每行两列 inline-block）
 SPM_ANCHOR_PREFIX = 'a2615.'
-# 采集结果输出文件名前缀（运行时加上时间戳，如 data_20250307_143022.xlsx）
 OUTPUT_EXCEL_PREFIX = 'data'
-# 搜索关键词列表默认值（用户可在运行时通过交互输入覆盖，多个关键词用逗号分隔）
-DEFAULT_SEARCH_KEYWORDS = [
+
+DEFAULT_SEARCH_KEYWORDS: list[str] = [
     '机械设备', '精密加工', '五金工具', '工业耗材', '汽车配件', 'led照明', '家具',
-    '家装建材', '塑料包装', '印刷', '健身器材', '户外园艺', '电子元器件', '传感器',
-    '安防设备', '宠物用品', '原材料',
+    '家装建材', '塑料包装', '印刷', '健身器材', '户外园艺', '电子元器件', '传感器', '安防设备', '宠物用品', '原材料',
 ]
-# 搜索地区筛选：省份（如 广东、浙江），空字符串表示不按省份筛选
 DEFAULT_TARGET_REGION = '广东'
-# 省份 -> 城市列表映射（按页面“从上到下、从左到右”顺序，一旦有就优先使用，不再从页面自动解析）
-DEFAULT_PROVINCE_CITY_MAP = {
+DEFAULT_PROVINCE_CITY_MAP: dict[str, list[str]] = {
     '广东': ['东莞'],
 }
-# 以下三个全局变量在 collectUserInput() 中根据用户交互输入赋值
-SEARCH_KEYWORDS_LIST = []
-TARGET_REGION = ''
-PROVINCE_CITY_MAP = {}
-# 每页抓取全部商家（不限制条数时用 0 或 None；正数时仅抓前 N 条，用于测试）
+
 MAX_FETCH_PER_PAGE = 0
-# Excel 表头（不含电话、传真；仅在有手机号时写入行），增加「当前城市」列
 EXCEL_HEADERS = ('企业名称', '关键词', '当前城市', '联系方式', '联系人', '手机', '地址')
-# 滑块验证最大等待时间（秒）默认值（可通过命令行参数覆盖）
+
+# ── 运行参数默认值 ───────────────────────────────────────
 DEFAULT_CAPTCHA_WAIT_TIMEOUT = 60
-# 单页全局异常最大允许次数默认值（超过后停止循环，避免极端情况下无限重试，可通过命令行参数覆盖）
 DEFAULT_MAX_PAGE_ERRORS = 10
-# 本次运行最多采集的商家数量（0 或负数表示不限制，可通过命令行参数覆盖）
 DEFAULT_TOTAL_MAX_SHOPS = 0
-# 单个店铺最少采集用时（秒），用于整体控制抓取节奏，降低触发风控风险
+
+# ── 节奏控制 ────────────────────────────────────────────
 MIN_SECONDS_PER_SHOP = 15
-# 翻页间额外随机等待范围（秒），模拟人类浏览行为
 PAGE_TURN_WAIT_MIN = 3
 PAGE_TURN_WAIT_MAX = 7
-# 关闭已知弹窗的 JS 片段：仅在 baxia 弹窗不含滑块验证码时移除，避免误删用户需要手动完成的验证码弹窗
-JS_REMOVE_BAXIA_MASK = "var d=document.querySelector('.baxia-dialog');var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);var m=document.querySelector('.baxia-dialog-mask');if(m&&!c)m.remove();"
-JS_REMOVE_BAXIA_DIALOG = "var d=document.querySelector('.baxia-dialog');var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);if(d&&!c)d.remove();"
-# 「亲，访问被拒绝」弹窗关键词（1688 反爬/风控提示）
+
+# ── 弹窗处理 JS ────────────────────────────────────────
+JS_REMOVE_BAXIA_MASK = (
+    "var d=document.querySelector('.baxia-dialog');"
+    "var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);"
+    "var m=document.querySelector('.baxia-dialog-mask');"
+    "if(m&&!c)m.remove();"
+)
+JS_REMOVE_BAXIA_DIALOG = (
+    "var d=document.querySelector('.baxia-dialog');"
+    "var c=d&&(d.innerText||'').match(/拖动|验证|slide/i);"
+    "if(d&&!c)d.remove();"
+)
 TEXT_ACCESS_DENIED = '访问被拒绝'
-# 访问被拒绝弹窗最大尝试关闭次数（避免死循环）
 MAX_ACCESS_DENIED_CLOSE_ATTEMPTS = 3
-# 触发「访问被拒绝」后的冷却等待时间范围（秒），降低后续请求被连续拦截的概率
 ACCESS_DENIED_COOLDOWN_MIN = 15
 ACCESS_DENIED_COOLDOWN_MAX = 30
+
 # ── 滑块自动拖拽相关常量 ──────────────────────────────────
-# 滑块按钮选择器列表（按优先级排列，匹配 1688 baxia NoCaptcha 常见结构）
 SLIDER_BTN_SELECTORS = [
     '#nc_1_n1z',
     '.nc_iconfont.btn_slide',
@@ -103,7 +105,6 @@ SLIDER_BTN_SELECTORS = [
     '.baxia-dialog .btn_slide',
     '.baxia-dialog .nc_iconfont',
 ]
-# 滑块轨道选择器列表（用于计算拖拽距离）
 SLIDER_TRACK_SELECTORS = [
     '#nc_1__scale_text',
     '#nc_1_wrapper',
@@ -114,7 +115,6 @@ SLIDER_TRACK_SELECTORS = [
     '.baxia-dialog .nc-lang-cnt',
     '.baxia-dialog .scale_text',
 ]
-# 滑块验证可能嵌套的 iframe 选择器
 SLIDER_IFRAME_SELECTORS = [
     '#baxia-dialog-content iframe',
     '.baxia-dialog iframe',
@@ -122,70 +122,183 @@ SLIDER_IFRAME_SELECTORS = [
     'iframe[src*="nocaptcha"]',
     'iframe[src*="captcha"]',
 ]
-# 自动拖拽默认滑动距离（当无法获取轨道宽度时使用）
 SLIDER_DEFAULT_DISTANCE = 340
-# 自动拖拽最大重试次数（每次失败后会略微调整策略）
 SLIDER_MAX_RETRY = 3
-# 自动拖拽单步最小/最大耗时（毫秒），用于模拟人类速度
 SLIDER_STEP_MIN_MS = 8
 SLIDER_STEP_MAX_MS = 25
 
+# ── 滚动加载常量 ────────────────────────────────────────
+SCROLL_STEP_PX = 600
+SCROLL_STEP_WAIT = 0.5
+SCROLL_FINAL_WAIT = 1.5
+EXPECTED_ITEMS_PER_PAGE = 20
 
-def cleanAddress(address_str):
-    """
-    清洗地址字符串：去掉末尾的「技术支持:xxx」等噪音，并截断到最大长度。
-    """
-    if not (address_str or '').strip():
+# ── 等待超时 ────────────────────────────────────────────
+LOGIN_WAIT_TIMEOUT = 120
+CONTACT_PAGE_WAIT_TIMEOUT = 15
+
+
+# ═══════════════════════════════════════════════════════════
+#  数据类：运行时配置
+# ═══════════════════════════════════════════════════════════
+
+@dataclass
+class ScraperConfig:
+    """运行时配置，聚合命令行参数和用户交互输入。"""
+    captcha_timeout: int = DEFAULT_CAPTCHA_WAIT_TIMEOUT
+    max_page_errors: int = DEFAULT_MAX_PAGE_ERRORS
+    total_max_shops: int = DEFAULT_TOTAL_MAX_SHOPS
+    keywords: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_KEYWORDS))
+    target_region: str = DEFAULT_TARGET_REGION
+    province_city_map: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_PROVINCE_CITY_MAP))
+
+
+# ═══════════════════════════════════════════════════════════
+#  纯函数 / 工具函数（不依赖 driver）
+# ═══════════════════════════════════════════════════════════
+
+def cleanAddress(raw: str) -> str:
+    """清洗地址字符串：去掉末尾「技术支持:xxx」等噪音，截断到最大长度。"""
+    if not (raw or '').strip():
         return ''
-    s = re.sub(PATTERN_ADDRESS_NOISE, '', address_str).strip()
-    return s[:MAX_ADDRESS_LEN] if s else ''
+    cleaned = re.sub(PATTERN_ADDRESS_NOISE, '', raw).strip()
+    return cleaned[:MAX_ADDRESS_LEN] if cleaned else ''
 
 
-def loadRuntimeConfig():
+def getShopOrigin(shop_url: str) -> str:
+    """从任意店铺 URL 解析出「协议 + 域名」，用于拼接 /page/contactinfo.htm。"""
+    if not (shop_url or '').strip():
+        return ''
+    try:
+        parsed = urlparse(shop_url.strip())
+        if parsed.scheme and parsed.netloc:
+            return f'{parsed.scheme}://{parsed.netloc}'
+    except Exception:
+        pass
+    return shop_url.rstrip('/').split('/page/')[0].split('?')[0] or shop_url
+
+
+def buildSearchUrl(keyword: str, province_name: str, city_name: str) -> str:
+    """根据关键词、省份与城市构造 1688 公司搜索页 URL（GBK 编码）。"""
+    try:
+        base = (
+            'https://s.1688.com/company/company_search.htm?'
+            'keywords=' + quote(keyword, encoding='gbk', safe='')
+            + '&n=y&spm=a260k.635.1998096057.d1'
+        )
+        if province_name:
+            base += '&province=' + quote(province_name, encoding='gbk', safe='')
+            if city_name:
+                base += '&city=' + quote(city_name, encoding='gbk', safe='')
+        return base
+    except Exception:
+        return (
+            'https://s.1688.com/company/company_search.htm?'
+            'keywords=' + quote(keyword, encoding='gbk', safe='')
+            + '&n=y&spm=a260k.635.1998096057.d1'
+        )
+
+
+def buildOutputFileName(config: ScraperConfig) -> str:
     """
-    通过命令行参数加载运行配置（验证码超时时间 / 页面异常上限 / 本次最多采集数量）。
-    若未传入对应参数，则使用默认常量值，方便根据当天风控情况灵活调整。
+    根据当前日期时间、搜索关键词和地区构造导出 Excel 文件名。
+    格式：YYYYMMDD_HHMMSS_搜索内容_地区.xlsx
     """
-    global CAPTCHA_WAIT_TIMEOUT, MAX_PAGE_ERRORS, TOTAL_MAX_SHOPS
+    MAX_SHOW_KEYWORDS = 3
+    try:
+        now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        region_desc = config.target_region or '全国'
 
-    parser = argparse.ArgumentParser(
-        description='1688 商家联系方式采集脚本运行参数'
-    )
+        if config.keywords:
+            shown = '+'.join(config.keywords[:MAX_SHOW_KEYWORDS])
+            if len(config.keywords) > MAX_SHOW_KEYWORDS:
+                keywords_part = f'{shown}等{len(config.keywords)}个'
+            else:
+                keywords_part = shown
+        else:
+            keywords_part = '未命名'
+
+        return f'{now_str}_{keywords_part.replace(" ", "")}_{region_desc}.xlsx'
+    except Exception:
+        return f'{OUTPUT_EXCEL_PREFIX}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+
+
+def extractContactByRegex(page_text: str) -> tuple[str, str, str, str, str]:
+    """
+    从页面纯文本中用正则提取联系人、电话、手机、传真、地址。
+    用于 DOM 取不到时的兜底。返回 (联系人, 电话, 手机, 传真, 地址)。
+    """
+    if not (page_text or '').strip():
+        return ('', '', '', '', '')
+
+    member_name = ''
+    tel = ''
+    mobile = ''
+    fax = ''
+    address = ''
+
+    m = PATTERN_CONTACT_LABEL.search(page_text)
+    if m:
+        member_name = re.sub(r'[\s\d].*', '', m.group(1).strip())[:20]
+    if not member_name:
+        m = PATTERN_CONTACT_SUFFIX.search(page_text)
+        if m:
+            member_name = m.group(1).strip()[:30]
+
+    m = PATTERN_TEL.search(page_text)
+    if m:
+        tel = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
+
+    m = PATTERN_MOBILE.search(page_text)
+    if m:
+        mobile = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
+
+    m = PATTERN_FAX.search(page_text)
+    if m:
+        fax = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
+
+    m = PATTERN_ADDRESS.search(page_text)
+    if m:
+        address = m.group(1).strip()
+    if not address:
+        m = PATTERN_ADDRESS_SIMPLE.search(page_text)
+        if m:
+            address = m.group(1).strip()
+    address = address[:MAX_ADDRESS_LEN]
+
+    return (member_name, tel, mobile, fax, address)
+
+
+# ═══════════════════════════════════════════════════════════
+#  配置加载与用户交互（在创建 Scraper 前调用）
+# ═══════════════════════════════════════════════════════════
+
+def loadRuntimeConfig() -> ScraperConfig:
+    """通过命令行参数加载运行配置，返回 ScraperConfig 实例。"""
+    parser = argparse.ArgumentParser(description='1688 商家联系方式采集脚本运行参数')
     parser.add_argument(
-        '--captcha-timeout',
-        type=int,
-        default=DEFAULT_CAPTCHA_WAIT_TIMEOUT,
+        '--captcha-timeout', type=int, default=DEFAULT_CAPTCHA_WAIT_TIMEOUT,
         help='滑块验证码最长等待时间（秒），默认 60 秒',
     )
     parser.add_argument(
-        '--max-page-errors',
-        type=int,
-        default=DEFAULT_MAX_PAGE_ERRORS,
+        '--max-page-errors', type=int, default=DEFAULT_MAX_PAGE_ERRORS,
         help='分页循环中允许的最大页面级异常次数，默认 10 次',
     )
     parser.add_argument(
-        '--max-shops',
-        type=int,
-        default=DEFAULT_TOTAL_MAX_SHOPS,
-        help='本次运行最多采集的商家数量，0 或负数表示不限制，适合测试时只抓前 N 家',
+        '--max-shops', type=int, default=DEFAULT_TOTAL_MAX_SHOPS,
+        help='本次运行最多采集的商家数量，0 或负数表示不限制',
     )
-
-    # 使用 parse_known_args，避免未来需要在 sys.argv 中加入其他参数时出错
     args, _ = parser.parse_known_args()
 
-    # 根据命令行参数更新全局运行时配置
-    CAPTCHA_WAIT_TIMEOUT = args.captcha_timeout if args.captcha_timeout > 0 else DEFAULT_CAPTCHA_WAIT_TIMEOUT
-    MAX_PAGE_ERRORS = args.max_page_errors if args.max_page_errors > 0 else DEFAULT_MAX_PAGE_ERRORS
-    TOTAL_MAX_SHOPS = args.max_shops if args.max_shops >= 0 else DEFAULT_TOTAL_MAX_SHOPS
+    return ScraperConfig(
+        captcha_timeout=args.captcha_timeout if args.captcha_timeout > 0 else DEFAULT_CAPTCHA_WAIT_TIMEOUT,
+        max_page_errors=args.max_page_errors if args.max_page_errors > 0 else DEFAULT_MAX_PAGE_ERRORS,
+        total_max_shops=args.max_shops if args.max_shops >= 0 else DEFAULT_TOTAL_MAX_SHOPS,
+    )
 
 
-def collectUserInput():
-    """
-    交互式收集用户输入：搜索关键词、目标省份、指定城市。
-    直接回车则使用默认值；输入内容用中文逗号或英文逗号分隔。
-    """
-    global SEARCH_KEYWORDS_LIST, TARGET_REGION, PROVINCE_CITY_MAP
-
+def collectUserInput(config: ScraperConfig) -> ScraperConfig:
+    """交互式收集用户输入：搜索关键词、目标省份、指定城市。直接回车使用默认值。"""
     print('=' * 60)
     print('  1688 商家采集工具 - 参数配置')
     print('=' * 60)
@@ -198,57 +311,51 @@ def collectUserInput():
     print()
     kw_input = input('请输入搜索关键词（多个用逗号分隔，直接回车使用默认值）: ').strip()
     if kw_input:
-        # 同时支持中文逗号「，」和英文逗号「,」以及中文顿号「、」作为分隔符
         raw_list = re.split(r'[,，、]+', kw_input)
-        SEARCH_KEYWORDS_LIST = [kw.strip() for kw in raw_list if kw.strip()]
+        config.keywords = [kw.strip() for kw in raw_list if kw.strip()]
     else:
-        SEARCH_KEYWORDS_LIST = list(DEFAULT_SEARCH_KEYWORDS)
-    print(f'  → 本次关键词（{len(SEARCH_KEYWORDS_LIST)} 个）: {SEARCH_KEYWORDS_LIST}')
+        config.keywords = list(DEFAULT_SEARCH_KEYWORDS)
+    print(f'  → 本次关键词（{len(config.keywords)} 个）: {config.keywords}')
     print()
 
     # ── 输入目标省份 ──
     print(f'当前默认省份: {DEFAULT_TARGET_REGION or "（不限省份）"}')
-    region_input = input('请输入目标省份（如 广东、浙江，留空表示不限省份，直接回车使用默认值）: ').strip()
-    if region_input:
-        TARGET_REGION = region_input
-    elif region_input == '':
-        # 用户直接回车 → 使用默认值；若想清空省份需输入特殊标记
-        TARGET_REGION = DEFAULT_TARGET_REGION
-    print(f'  → 本次省份: {TARGET_REGION or "（不限省份，全国范围）"}')
+    region_input = input('请输入目标省份（如 广东、浙江，留空不限，直接回车使用默认值）: ').strip()
+    config.target_region = region_input if region_input else DEFAULT_TARGET_REGION
+    print(f'  → 本次省份: {config.target_region or "（不限省份，全国范围）"}')
     print()
 
     # ── 输入指定城市 ──
-    default_cities = DEFAULT_PROVINCE_CITY_MAP.get(TARGET_REGION, [])
+    default_cities = DEFAULT_PROVINCE_CITY_MAP.get(config.target_region, [])
     if default_cities:
         print(f'当前默认城市: {", ".join(default_cities)}')
     else:
         print('当前无预置城市（将自动从页面解析）')
     city_input = input(
-        '请输入指定城市（多个用逗号分隔，留空表示自动解析全省城市，直接回车使用默认值）: '
+        '请输入指定城市（多个用逗号分隔，留空自动解析，直接回车使用默认值）: '
     ).strip()
     if city_input:
         raw_cities = re.split(r'[,，、]+', city_input)
         user_cities = [c.strip() for c in raw_cities if c.strip()]
-        if user_cities and TARGET_REGION:
-            PROVINCE_CITY_MAP = {TARGET_REGION: user_cities}
-        elif user_cities:
-            PROVINCE_CITY_MAP = {}
-    elif city_input == '' and default_cities:
-        # 用户直接回车 → 使用默认值
-        PROVINCE_CITY_MAP = dict(DEFAULT_PROVINCE_CITY_MAP)
+        if user_cities and config.target_region:
+            config.province_city_map = {config.target_region: user_cities}
+        else:
+            config.province_city_map = {}
+    elif default_cities:
+        config.province_city_map = dict(DEFAULT_PROVINCE_CITY_MAP)
     else:
-        PROVINCE_CITY_MAP = {}
+        config.province_city_map = {}
 
-    final_cities = PROVINCE_CITY_MAP.get(TARGET_REGION, [])
+    final_cities = config.province_city_map.get(config.target_region, [])
     if final_cities:
         print(f'  → 本次城市: {", ".join(final_cities)}')
     else:
-        print(f'  → 本次城市: （自动从页面解析全省城市列表）')
+        print('  → 本次城市: （自动从页面解析全省城市列表）')
 
     print()
     print('=' * 60)
-    print(f'  关键词: {SEARCH_KEYWORDS_LIST}')
-    print(f'  省份:   {TARGET_REGION or "不限"}')
+    print(f'  关键词: {config.keywords}')
+    print(f'  省份:   {config.target_region or "不限"}')
     print(f'  城市:   {final_cities or "自动解析"}')
     print('=' * 60)
     print()
@@ -257,189 +364,717 @@ def collectUserInput():
         print('已取消，程序退出。')
         sys.exit(0)
     print()
+    return config
 
 
-def getShopOrigin(shop_url):
-    """
-    从任意店铺 URL 解析出「协议 + 域名」，用于拼接 /page/contactinfo.htm。
-    避免带路径的 URL（如 .../page/main.htm）被错误拼接成 .../page/main.htm/page/contactinfo.htm。
-    """
-    if not (shop_url or '').strip():
-        return ''
-    try:
-        parsed = urlparse(shop_url.strip())
-        if parsed.scheme and parsed.netloc:
-            return f'{parsed.scheme}://{parsed.netloc}'
-    except Exception:
-        pass
-    return shop_url.rstrip('/').split('/page/')[0].split('?')[0] or shop_url
+# ═══════════════════════════════════════════════════════════
+#  核心采集器类
+# ═══════════════════════════════════════════════════════════
 
+class AlibabaScraper:
+    """1688 商家联系方式采集器，封装浏览器驱动、Excel 写入和采集流程。"""
 
-def closeKnownPopups(driver):
-    """
-    关闭已知的冗余弹窗（如 baxia 遮罩/对话框），不关闭滑块验证框，避免多框叠加。
-    在打开新窗口或加载联系页后调用，减少「弹出多个框」的干扰。
-    同时补强覆盖 navigator.webdriver 标记，防止部分页面在跳转后恢复检测属性。
-    """
-    try:
-        # 每次切换页面/弹窗操作时再次覆盖 webdriver 属性，防止页面内 JS 恢复检测
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-        driver.execute_script(JS_REMOVE_BAXIA_MASK)
-        driver.execute_script(JS_REMOVE_BAXIA_DIALOG)
-    except Exception:
-        pass
+    def __init__(self, config: ScraperConfig):
+        self.config = config
+        self.driver: Optional[webdriver.Chrome] = None
+        self.wait: Optional[WebDriverWait] = None
+        self.wb: Optional[Workbook] = None
+        self.ws = None
+        self.output_file = ''
+        self.excel_row = 2
+        self.seen_shops: set[str] = set()
+        self.total_collected = 0
+        self._stop = False
 
+    # ── 生命周期 ──────────────────────────────────────────
 
-def closeAccessDeniedPopup(driver):
-    """
-    检测并尝试关闭「亲，访问被拒绝」弹窗（1688 风控提示）。
-    若页面存在该文案，则尝试点击关闭按钮或移除弹窗 DOM。
-    关闭后会进行冷却等待（避免连续请求再次触发风控），然后刷新页面尝试恢复。
-    返回 True 表示曾检测到并已尝试处理，False 表示未发现该弹窗。
-    """
-    try:
-        body_text = (driver.find_element(By.TAG_NAME, 'body').text or '')
-        if TEXT_ACCESS_DENIED not in body_text:
-            return False
+    def __enter__(self):
+        self._initDriver()
+        self._initExcel()
+        return self
 
-        print(f'  ⚠ 检测到「访问被拒绝」弹窗，进入冷却等待以降低风控风险...')
-        closed = False
-        for _ in range(MAX_ACCESS_DENIED_CLOSE_ATTEMPTS):
-            try:
-                deny_els = driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(text(),'" + TEXT_ACCESS_DENIED + "')]"
-                )
-                for el in deny_els:
-                    try:
-                        parent = el.find_element(
-                            By.XPATH,
-                            "./ancestor::*[contains(@class,'dialog') or contains(@class,'modal') or contains(@class,'popup')][1]"
-                        )
-                        close_btns = parent.find_elements(
-                            By.XPATH,
-                            ".//*[contains(@class,'close') or text()='×' or text()='关闭' or contains(text(),'×')]"
-                        )
-                        if close_btns:
-                            driver.execute_script("arguments[0].click();", close_btns[0])
-                            closed = True
-                            time.sleep(1)
-                            break
-                    except Exception:
-                        pass
-                if closed:
-                    break
-                script = """
-                var text = '""" + TEXT_ACCESS_DENIED + """';
-                var all = document.querySelectorAll('div, section');
-                for (var i = all.length - 1; i >= 0; i--) {
-                    var el = all[i];
-                    if (el.innerText && el.innerText.indexOf(text) !== -1) {
-                        var p = el.closest('.dialog') || el.closest('.modal') || el.closest('[class*="dialog"]') || el.closest('[class*="modal"]') || el.parentElement;
-                        if (p) { p.remove(); return true; }
-                    }
-                }
-                return false;
-                """
-                removed = driver.execute_script(script)
-                if removed:
-                    closed = True
-                    break
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-        # 不论弹窗是否成功关闭，都进行冷却等待再刷新，避免连续请求被再次拦截
-        cooldown = random.uniform(ACCESS_DENIED_COOLDOWN_MIN, ACCESS_DENIED_COOLDOWN_MAX)
-        print(f'  → 冷却等待 {cooldown:.0f} 秒后刷新页面...')
-        time.sleep(cooldown)
-        try:
-            driver.refresh()
-            time.sleep(random.uniform(3, 5))
-        except Exception:
-            pass
-        return True
-    except Exception:
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
         return False
 
-
-def resolveShopUrl(driver, href_value):
-    """
-    若链接为 1688 跳转链接（dj.1688.com/ci_bb），先访问一次取重定向后的真实店铺 URL，
-    再用于拼接 /page/contactinfo.htm，避免联系方式页打开错误。
-    返回可用于拼接联系页的店铺 base URL（可能带路径，后续由 getShopOrigin 取纯域名）。
-    """
-    if not (href_value or '').strip():
-        return href_value or ''
-    href = href_value.strip().rstrip('/')
-    # 判断是否为跳转链接（非真实店铺页）
-    is_redirect = (RESOLVE_REDIRECT_HOST in href) or (RESOLVE_REDIRECT_PATH in href)
-    if not is_redirect:
-        return href
-    try:
-        driver.get(href)
-        time.sleep(random.uniform(2, 4))
-        real_url = driver.current_url or href
-        # 若跳转后仍是异常 URL，保留原 href 避免死链
-        if real_url and '.1688.com' in real_url and 'ci_bb' not in real_url:
-            return real_url.rstrip('/')
-        return href
-    except Exception:
-        return href
-
-
-def extractContactByDom(driver):
-    """
-    从当前页面 DOM 中提取联系人、电话、手机、传真、地址。
-    优先匹配 1688 联系块结构：带 data-spm-anchor-id 的容器内，每行「标签：」+ 值（两列 inline-block）。
-    返回 (member_name, tel, mobile, fax, address)，未找到的项为 ''。
-    """
-    member_name = ''
-    tel = ''
-    mobile = ''
-    fax = ''
-    address = ''
-    try:
-        # 方法0：1688 联系块结构——父级 div[data-spm-anchor-id] 内多行，每行两列（电话：/手机：/传真：/地址： + 值）
+    def close(self):
+        """保存 Excel 并关闭浏览器，确保资源释放。"""
         try:
-            containers = driver.find_elements(
-                By.XPATH,
-                "//div[contains(@data-spm-anchor-id,'" + SPM_ANCHOR_PREFIX + "') and .//div[contains(text(),'电话：')]]"
-            )
-            for container in containers:
-                # 每行是容器的直接子 div，行内两个子 div 分别为标签、值
-                rows = container.find_elements(By.XPATH, "./div")
-                for row in rows:
-                    parts = row.find_elements(By.XPATH, "./div")
-                    if len(parts) < 2:
-                        continue
-                    label_text = (parts[0].text or '').strip()
-                    value_el = parts[1]
-                    value_text = (value_el.text or '').strip()
-                    # 地址可能被省略显示，完整内容在 title 中
-                    if LABEL_ADDRESS in label_text or label_text == '地址：' or label_text == '地址':
-                        title_addr = value_el.get_attribute('title')
-                        if title_addr and title_addr.strip():
-                            value_text = title_addr.strip()
-                        if value_text and not address:
-                            address = value_text[:MAX_ADDRESS_LEN]
-                    elif LABEL_TEL in label_text or label_text == '电话：' or label_text == '电话':
-                        if value_text and not tel:
-                            tel = re.sub(r'\s+', ' ', re.sub(r'[^\d\-\s]', '', value_text)).strip()[:50]
-                    elif LABEL_MOBILE in label_text or label_text == '手机：' or label_text == '手机':
-                        if value_text and not mobile:
-                            mobile = re.sub(r'\s+', ' ', re.sub(r'[^\d\-\s]', '', value_text)).strip()[:50]
-                    elif LABEL_FAX in label_text or label_text == '传真：' or label_text == '传真':
-                        if value_text and not fax:
-                            fax = re.sub(r'\s+', ' ', re.sub(r'[^\d\-\s]', '', value_text)).strip()[:50]
-                if tel or mobile or fax or address:
-                    break
+            if self.wb:
+                self.wb.save(self.output_file)
+                print(f'数据已保存到 {self.output_file}')
+        except Exception as e:
+            print(f'✗ 保存 Excel 时出错: {e}')
+        try:
+            if self.driver:
+                self.driver.quit()
         except Exception:
             pass
 
-        # 方法1：dl > dt + dd 成对（常见于 1688 联系信息块）
-        if not tel and not mobile and not fax and not address:
-            dts = driver.find_elements(By.TAG_NAME, 'dt')
+    # ── 初始化 ────────────────────────────────────────────
+
+    def _initDriver(self):
+        """
+        优先使用 undetected-chromedriver 创建浏览器实例（底层 patch 反检测），
+        不可用时依次退化到普通 Selenium Chrome、Firefox。
+        """
+        # 方案 1：undetected-chromedriver（推荐）
+        try:
+            options = uc.ChromeOptions()
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--lang=zh-CN')
+            self.driver = uc.Chrome(options=options)
+            self.wait = WebDriverWait(self.driver, LOGIN_WAIT_TIMEOUT)
+            return
+        except Exception as e_uc:
+            print(f'undetected-chromedriver 启动失败: {str(e_uc)[:80]}')
+
+        # 方案 2：普通 Selenium Chrome + 手动反检测
+        try:
+            options = webdriver.ChromeOptions()
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            options.add_experimental_option('useAutomationExtension', False)
+            self.driver = webdriver.Chrome(options=options)
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                if (!window.chrome) {
+                    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+                }
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(parameters)
+                );
+            """})
+            self.wait = WebDriverWait(self.driver, LOGIN_WAIT_TIMEOUT)
+            return
+        except Exception as e_chrome:
+            print(f'普通 Chrome 不可用: {str(e_chrome)[:50]}')
+
+        # 方案 3：Firefox 兜底
+        try:
+            self.driver = webdriver.Firefox()
+            self.wait = WebDriverWait(self.driver, LOGIN_WAIT_TIMEOUT)
+        except Exception as e_ff:
+            raise RuntimeError(f'所有浏览器均不可用: {e_ff}') from e_ff
+
+    def _initExcel(self):
+        """创建 Excel 工作簿并写入表头。"""
+        self.output_file = buildOutputFileName(self.config)
+        self.wb = Workbook()
+        self.ws = self.wb.active
+        self.ws.title = '采集数据'
+        for col, header in enumerate(EXCEL_HEADERS, start=1):
+            self.ws.cell(row=1, column=col, value=header)
+
+    # ── 登录流程 ──────────────────────────────────────────
+
+    def login(self):
+        """打开淘宝登录页并等待用户扫码，登录后访问 1688 建立会话。"""
+        self.driver.get('https://login.taobao.com/member/login.jhtml')
+
+        try:
+            self.wait.until(EC.url_contains('taobao.com/'))
+            self.wait.until_not(EC.url_contains('login.taobao.com'))
+            print('✓ 登录成功！')
+        except Exception:
+            if 'login.taobao.com' not in self.driver.current_url:
+                print('✓ 登录成功！')
+            else:
+                print('✗ 登录超时，请重新运行脚本并及时扫码')
+                raise SystemExit(1)
+
+        print('正在建立 1688 会话...')
+        self.driver.get('https://www.1688.com/')
+        time.sleep(random.uniform(3, 5))
+        print('1688 会话已建立')
+
+    # ── 主采集入口 ────────────────────────────────────────
+
+    def run(self):
+        """主采集流程：解析城市列表 → 生成任务队列 → 逐任务采集。"""
+        city_list = self._resolveCityList()
+        task_queue = [
+            (city, kw)
+            for city in city_list
+            for kw in self.config.keywords
+        ]
+        print(f'共 {len(task_queue)} 个采集任务（{len(city_list)} 城市 × {len(self.config.keywords)} 关键词）')
+
+        for idx, (city, keyword) in enumerate(task_queue, start=1):
+            if self._stop:
+                break
+            self._processTask(idx, len(task_queue), city, keyword)
+
+        print(f'✓ 采集完成！共写入 {self.total_collected} 条数据 → {self.output_file}')
+
+    # ── 城市列表解析 ──────────────────────────────────────
+
+    def _resolveCityList(self) -> list[str]:
+        """根据省份配置解析城市列表，无省份则返回 ['']（全国维度抓取一次）。"""
+        if not self.config.target_region:
+            return ['']
+
+        city_list = self._getCityListByProvince(
+            self.config.target_region, self.config.keywords[0]
+        )
+        if not city_list:
+            print(f'未能解析省份「{self.config.target_region}」的城市列表，将按整省抓取')
+            return ['']
+
+        effective = [c for c in city_list if c]
+        print(f'省份「{self.config.target_region}」共 {len(effective)} 个城市: {city_list}')
+        return city_list
+
+    def _getCityListByProvince(self, province_name: str, keyword: str) -> list[str]:
+        """
+        从 1688 搜索页「所在地区」筛选中解析指定省份下的城市列表。
+        按视觉顺序（从上到下、从左到右）排序返回。
+        """
+        # 优先使用预置城市列表
+        preset = self.config.province_city_map.get(province_name)
+        if preset:
+            print(f'省份「{province_name}」使用预置城市列表: {preset}')
+            return list(preset)
+
+        city_list: list[str] = []
+        try:
+            url = buildSearchUrl(keyword, province_name, '')
+            self.driver.get(url)
+
+            try:
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_all_elements_located(
+                        (By.CSS_SELECTOR, 'div.sm-widget-address, div.sm-widget-region, div.address-widget')
+                    )
+                )
+            except Exception:
+                pass
+
+            # 尝试点击省份展开城市列表
+            self._clickProvinceExpander(province_name)
+
+            candidates = self._collectCityCandidates(province_name)
+            if not candidates:
+                print(f'未在省份「{province_name}」页面上找到城市链接元素')
+                return []
+
+            # 按视觉位置排序（从上到下、从左到右），然后去重
+            candidates.sort(key=lambda item: (round(item[0], 1), round(item[1], 1)))
+            seen: set[str] = set()
+            for _, _, name in candidates:
+                if name not in seen:
+                    seen.add(name)
+                    city_list.append(name)
+        except Exception as e:
+            print(f'自动解析省份「{province_name}」城市列表失败: {e}')
+
+        return city_list
+
+    def _clickProvinceExpander(self, province_name: str):
+        """尝试点击省份元素以展开城市列表。"""
+        try:
+            elements = self.driver.find_elements(By.XPATH, f"//*[text()='{province_name}']")
+            for el in elements:
+                try:
+                    self.driver.execute_script('arguments[0].click();', el)
+                    time.sleep(1)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _collectCityCandidates(self, province_name: str) -> list[tuple[float, float, str]]:
+        """
+        从地区筛选区域收集所有城市候选元素及其视觉位置。
+        返回 [(top, left, city_name), ...] 列表。
+        """
+        candidates: list[tuple[float, float, str]] = []
+        IGNORED_NAMES = {'不限', '全部', '全国'}
+        CITY_PATTERN = re.compile(r'^[\u4e00-\u9fa5]{1,6}$')
+
+        def _extractFromLinks(links):
+            for link in links:
+                text_val = (link.text or '').strip()
+                if not text_val or text_val in IGNORED_NAMES or not CITY_PATTERN.match(text_val):
+                    continue
+                top, left = self._getElementPosition(link)
+                candidates.append((top, left, text_val))
+
+        # 方式 1：从地区筛选容器内查找
+        try:
+            containers = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class,'sm-widget-address') or "
+                "contains(@class,'sm-widget-region') or "
+                "contains(@class,'address-widget')]"
+            )
+            for container in containers:
+                _extractFromLinks(container.find_elements(By.TAG_NAME, 'a'))
+        except Exception:
+            pass
+
+        # 方式 2：全局兜底查找带 &city= 参数的链接
+        if not candidates:
+            try:
+                links = self.driver.find_elements(
+                    By.XPATH,
+                    "//a[@href and contains(@href,'company_search.htm') and contains(@href,'city=')]"
+                )
+                _extractFromLinks(links)
+            except Exception:
+                pass
+
+        return candidates
+
+    def _getElementPosition(self, element) -> tuple[float, float]:
+        """获取 DOM 元素在视口中的位置 (top, left)。"""
+        try:
+            rect = self.driver.execute_script(
+                'var r = arguments[0].getBoundingClientRect(); return [r.top, r.left];',
+                element,
+            )
+            return (float(rect[0]), float(rect[1])) if rect and len(rect) >= 2 else (0.0, 0.0)
+        except Exception:
+            return (0.0, 0.0)
+
+    # ── 单个任务（城市 + 关键词）处理 ────────────────────────
+
+    def _processTask(self, task_idx: int, total_tasks: int, city: str, keyword: str):
+        """处理单个（城市, 关键词）任务：逐页采集直到无下一页或达到上限。"""
+        city_desc = city or '整省/全国'
+        print('━' * 50)
+        print(f'任务 [{task_idx}/{total_tasks}] 关键词「{keyword}」城市「{city_desc}」')
+
+        search_url = buildSearchUrl(keyword, self.config.target_region, city)
+        self.driver.get(search_url)
+
+        main_window = self.driver.current_window_handle
+        page_error_count = 0
+        page_num = 1
+
+        while not self._stop:
+            try:
+                should_continue = self._processPage(
+                    keyword, city, page_num, main_window
+                )
+                if not should_continue:
+                    break
+
+                # 翻页
+                if not self._goToNextPage(keyword, city, page_num):
+                    break
+                page_num += 1
+
+            except Exception as e:
+                print(f'页面级异常: {e}')
+                page_error_count += 1
+                if page_error_count >= self.config.max_page_errors:
+                    print(f'任务「{keyword}」「{city_desc}」页面异常达上限 {self.config.max_page_errors} 次，终止该任务')
+                    break
+
+    def _processPage(
+        self, keyword: str, city: str, page_num: int, main_window: str
+    ) -> bool:
+        """
+        处理当前搜索结果页：抓取所有商家的联系信息。
+        返回 True 表示可继续翻页，False 表示应终止当前任务。
+        """
+        city_desc = city or '整省/全国'
+        self._closeKnownPopups()
+        if self._closeAccessDeniedPopup():
+            print('检测到「访问被拒绝」弹窗，已尝试关闭')
+
+        # 等待搜索结果列表加载
+        try:
+            self.wait.until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'a.company-name'))
+            )
+        except Exception:
+            pass
+
+        self._scrollToLoadAllResults()
+
+        titles = self.driver.find_elements(By.CSS_SELECTOR, 'a.company-name')
+        if not titles:
+            self._logEmptyPage(page_num)
+            return False
+
+        print(f'关键词「{keyword}」城市「{city_desc}」第 {page_num} 页找到 {len(titles)} 个商家')
+
+        # 检查是否已到末页
+        if self._isLastPage(keyword, city_desc, page_num):
+            return False
+
+        # 收集当前页所有商家数据并按垂直位置排序
+        page_data = self._collectPageData(titles)
+        ordered = page_data[:MAX_FETCH_PER_PAGE] if MAX_FETCH_PER_PAGE else page_data
+
+        for _, title_el, title_value, href_value in ordered:
+            if self._stop:
+                break
+            self._scrollToElement(title_el)
+            self._processShop(title_el, title_value, href_value, keyword, city, main_window)
+
+        return True
+
+    def _collectPageData(self, title_elements) -> list[tuple[float, object, str, str]]:
+        """收集当前页所有商家信息并按垂直位置排序，返回 [(top, element, title, href), ...]。"""
+        page_data: list[tuple[float, object, str, str]] = []
+        for el in title_elements:
+            title_value = el.get_attribute('title') or el.text
+            href_value = el.get_attribute('href')
+            if not href_value:
+                continue
+            top = self._getElementPosition(el)[0]
+            page_data.append((top, el, title_value, href_value))
+
+        page_data.sort(key=lambda x: x[0])
+        return page_data
+
+    def _logEmptyPage(self, page_num: int):
+        """列表为空时记录日志，区分「访问被拒绝」和「无结果」两种情况。"""
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, 'body').text or ''
+            if TEXT_ACCESS_DENIED in body_text:
+                print(f'第 {page_num} 页列表为空，存在「访问被拒绝」提示')
+            else:
+                print('该关键词在当前城市没有搜索结果，跳到下一个任务')
+        except Exception:
+            pass
+
+    def _isLastPage(self, keyword: str, city_desc: str, page_num: int) -> bool:
+        """解析分页控件，判断当前是否已达末页。"""
+        try:
+            pager_elements = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "div.fui-pager, div.sm-pagination, div[class*='pagination'], span.page-count"
+            )
+            pager_text = ''
+            for el in pager_elements:
+                text_val = (el.text or '').strip()
+                if text_val:
+                    pager_text = text_val
+                    break
+
+            total_pages = 0
+            if pager_text:
+                m = re.search(r'/\s*(\d+)', pager_text) or re.search(r'共\s*(\d+)\s*页', pager_text)
+                if m:
+                    total_pages = int(m.group(1))
+
+            if total_pages > 0:
+                print(f'关键词「{keyword}」城市「{city_desc}」搜索结果共 {total_pages} 页')
+                if page_num >= total_pages:
+                    print(f'已达末页（第 {page_num}/{total_pages} 页），结束该任务')
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # ── 单个商家处理 ──────────────────────────────────────
+
+    def _processShop(
+        self, title_el, title_value: str, href_value: str,
+        keyword: str, city: str, main_window: str,
+    ):
+        """在新标签中打开商家联系页，提取联系信息，写入 Excel。"""
+        shop_start = time.time()
+        href = (href_value or '').strip()
+        is_redirect = (RESOLVE_REDIRECT_HOST in href) or (RESOLVE_REDIRECT_PATH in href)
+
+        try:
+            shop_origin, contact_url = self._openContactPage(href, is_redirect, main_window)
+            if shop_origin is None:
+                return
+
+            dedup_key = shop_origin or href or title_value
+            if dedup_key in self.seen_shops:
+                print(f'  跳过重复店铺（已采集）: {title_value}')
+                self._closeTabAndReturn(main_window)
+                return
+            self.seen_shops.add(dedup_key)
+
+            # 确保真正进入联系页
+            self._ensureContactPage(contact_url)
+
+            # 等待联系页内容渲染
+            page_text = self._waitForContactContent()
+
+            # 处理验证码
+            resolved, waited = self._waitCaptchaResolved()
+            if not resolved:
+                print(f'验证码超时，跳过: {title_value}')
+                self._closeTabAndReturn(main_window)
+                return
+
+            if waited > 0:
+                print('验证通过，刷新页面重新获取联系数据...')
+                page_text = self._refreshAndGetText(page_text)
+
+            # 提取联系信息（DOM 优先，正则兜底）
+            contact = self._extractContact(page_text)
+            mobile_stripped = (contact['mobile'] or '').strip()
+
+            if mobile_stripped:
+                self._writeToExcel(title_value, keyword, city, contact_url, contact)
+                self.total_collected += 1
+                print(f'已累计写入 {self.total_collected} 条数据')
+                self._checkCollectLimit()
+                self._throttle(shop_start)
+            else:
+                time.sleep(random.uniform(3, 6))
+
+            self.driver.close()
+            self.driver.switch_to.window(main_window)
+
+        except Exception as e:
+            print(f'采集失败 [{title_value}]: {e}')
+            self._safeCloseAndReturn(main_window)
+
+    def _openContactPage(
+        self, href: str, is_redirect: bool, main_window: str,
+    ) -> tuple[Optional[str], str]:
+        """
+        在新标签中打开联系方式页。
+        返回 (shop_origin, contact_url)；若应跳过该商家则返回 (None, '')。
+        """
+        if not is_redirect:
+            shop_origin = getShopOrigin(href)
+            if not shop_origin:
+                print('  无法解析店铺域名，跳过')
+                return None, ''
+            contact_url = shop_origin.rstrip('/') + '/page/contactinfo.htm'
+            self.driver.execute_script("window.open(arguments[0], '_blank');", contact_url)
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+            self._closeKnownPopups()
+        else:
+            self.driver.execute_script("window.open(arguments[0], '_blank');", href)
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+            self._closeKnownPopups()
+            shop_origin = getShopOrigin((self.driver.current_url or '').strip())
+            if not shop_origin:
+                print('  无法解析店铺域名（跳转链接），跳过')
+                self._closeTabAndReturn(main_window)
+                return None, ''
+            contact_url = shop_origin.rstrip('/') + '/page/contactinfo.htm'
+            self.driver.get(contact_url)
+            self._closeKnownPopups()
+
+        return shop_origin, contact_url
+
+    def _ensureContactPage(self, contact_url: str):
+        """若未真正进入联系页，用当前域名再试一次。"""
+        current = (self.driver.current_url or '').strip()
+        if 'contactinfo' not in current and '.1688.com' in current:
+            retry_origin = getShopOrigin(current)
+            if retry_origin:
+                self.driver.get(retry_origin.rstrip('/') + '/page/contactinfo.htm')
+            self._closeKnownPopups()
+
+        if 'contactinfo' not in (self.driver.current_url or ''):
+            print(f'未进入联系方式页: {(self.driver.current_url or "")[:80]}')
+
+    def _waitForContactContent(self) -> str:
+        """等待联系方式页异步内容加载完成，返回页面文本。"""
+        try:
+            contact_wait = WebDriverWait(self.driver, CONTACT_PAGE_WAIT_TIMEOUT, poll_frequency=1)
+            contact_wait.until(lambda d: any(
+                kw in (d.find_element(By.TAG_NAME, 'body').text or '')
+                for kw in ['电话', '手机', '地址', '联系人', '传真']
+            ))
+        except Exception:
+            time.sleep(3)
+
+        return self.driver.find_element(By.TAG_NAME, 'body').text or ''
+
+    def _refreshAndGetText(self, fallback: str) -> str:
+        """刷新页面并重新获取文本内容。"""
+        try:
+            self.driver.refresh()
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, 'body'))
+            )
+            return self.driver.find_element(By.TAG_NAME, 'body').text or ''
+        except Exception:
+            return fallback
+
+    def _extractContact(self, page_text: str) -> dict[str, str]:
+        """先 DOM 提取联系信息，不足部分用正则兜底。返回 dict。"""
+        member_name, tel, mobile, fax, address = self._extractContactByDom()
+        if not all([member_name, tel, mobile, fax, address]):
+            r_name, r_tel, r_mobile, r_fax, r_addr = extractContactByRegex(page_text)
+            member_name = member_name or r_name
+            tel = tel or r_tel
+            mobile = mobile or r_mobile
+            fax = fax or r_fax
+            address = address or r_addr
+
+        return {
+            'member_name': member_name,
+            'tel': tel,
+            'mobile': mobile,
+            'fax': fax,
+            'address': cleanAddress(address),
+        }
+
+    def _writeToExcel(
+        self, title: str, keyword: str, city: str,
+        contact_url: str, contact: dict[str, str],
+    ):
+        """将一条商家记录写入 Excel 并即时保存。"""
+        city_for_excel = city or (self.config.target_region or '全国')
+        row_data = (
+            title,
+            keyword,
+            city_for_excel,
+            contact_url,
+            contact.get('member_name', ''),
+            contact.get('mobile', ''),
+            contact.get('address', ''),
+        )
+        for col, val in enumerate(row_data, start=1):
+            self.ws.cell(row=self.excel_row, column=col, value=val)
+        self.excel_row += 1
+        self.wb.save(self.output_file)
+
+    def _checkCollectLimit(self):
+        """检查是否达到本次运行的采集上限。"""
+        if self.config.total_max_shops > 0 and self.total_collected >= self.config.total_max_shops:
+            print(f'已达采集上限 {self.config.total_max_shops}，停止后续采集')
+            self._stop = True
+
+    def _throttle(self, shop_start: float):
+        """控制单条采集最少耗时，降低触发风控的概率。"""
+        elapsed = time.time() - shop_start
+        target = MIN_SECONDS_PER_SHOP + random.uniform(-2, 2)
+        target = max(target, MIN_SECONDS_PER_SHOP * 0.8)
+        extra = max(0, target - elapsed)
+        if extra > 0:
+            time.sleep(extra)
+
+    # ── 翻页 ─────────────────────────────────────────────
+
+    def _goToNextPage(self, keyword: str, city: str, page_num: int) -> bool:
+        """尝试点击下一页，返回 True 表示成功翻页，False 表示无下一页。"""
+        city_desc = city or '整省/全国'
+        page_elements = self.driver.find_elements(By.CSS_SELECTOR, 'a.fui-next')
+        if not page_elements:
+            print(f'关键词「{keyword}」城市「{city_desc}」没有下一页，结束该任务')
+            return False
+
+        next_btn = page_elements[0]
+        try:
+            cls = (next_btn.get_attribute('class') or '').lower()
+            disabled = (next_btn.get_attribute('aria-disabled') or '').lower()
+            if 'disabled' in cls or 'fui-next-disabled' in cls or disabled == 'true':
+                print(f'关键词「{keyword}」城市「{city_desc}」已是最后一页')
+                return False
+        except Exception:
+            pass
+
+        time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
+        self._scrollToBottom()
+        time.sleep(random.uniform(2, 4))
+        self._closeKnownPopups()
+        self.driver.execute_script('arguments[0].click();', next_btn)
+        time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
+        return True
+
+    # ── DOM 联系信息提取 ──────────────────────────────────
+
+    def _extractContactByDom(self) -> tuple[str, str, str, str, str]:
+        """
+        从当前页面 DOM 中提取联系人、电话、手机、传真、地址。
+        优先匹配 1688 联系块结构（data-spm-anchor-id 容器），依次退化到 dl/dt/dd、class 关键词、全文正则。
+        返回 (联系人, 电话, 手机, 传真, 地址)。
+        """
+        member_name = ''
+        tel = ''
+        mobile = ''
+        fax = ''
+        address = ''
+
+        try:
+            # 方法 0：1688 联系块结构 data-spm-anchor-id 容器
+            tel, mobile, fax, address = self._extractFromSpmContainer()
+
+            # 方法 1：dl > dt + dd 配对
+            if not any([tel, mobile, fax, address]):
+                member_name, tel, mobile, fax, address = self._extractFromDlDtDd()
+
+            # 方法 2：class 含关键词的块
+            if not member_name or not tel or not address:
+                mn, tl, addr = self._extractFromClassKeywords()
+                member_name = member_name or mn
+                tel = tel or tl
+                address = address or addr
+
+            # 方法 3：全文文本正则
+            if not all([member_name, tel, mobile, fax, address]):
+                body_text = self.driver.find_element(By.TAG_NAME, 'body').text or ''
+                r_name, r_tel, r_mobile, r_fax, r_addr = extractContactByRegex(body_text)
+                member_name = member_name or r_name
+                tel = tel or r_tel
+                mobile = mobile or r_mobile
+                fax = fax or r_fax
+                address = address or r_addr
+        except Exception:
+            pass
+
+        return (member_name or '', tel or '', mobile or '', fax or '', address or '')
+
+    def _extractFromSpmContainer(self) -> tuple[str, str, str, str]:
+        """从 data-spm-anchor-id 容器中提取电话、手机、传真、地址。"""
+        tel = mobile = fax = address = ''
+        try:
+            containers = self.driver.find_elements(
+                By.XPATH,
+                f"//div[contains(@data-spm-anchor-id,'{SPM_ANCHOR_PREFIX}') "
+                f"and .//div[contains(text(),'电话：')]]"
+            )
+            for container in containers:
+                rows = container.find_elements(By.XPATH, './div')
+                for row in rows:
+                    parts = row.find_elements(By.XPATH, './div')
+                    if len(parts) < 2:
+                        continue
+                    label = (parts[0].text or '').strip()
+                    value_el = parts[1]
+                    value = (value_el.text or '').strip()
+
+                    if LABEL_ADDRESS in label or label in ('地址：', '地址'):
+                        title_addr = value_el.get_attribute('title')
+                        if title_addr and title_addr.strip():
+                            value = title_addr.strip()
+                        if value and not address:
+                            address = value[:MAX_ADDRESS_LEN]
+                    elif LABEL_TEL in label or label in ('电话：', '电话'):
+                        if value and not tel:
+                            tel = self._cleanPhone(value)
+                    elif LABEL_MOBILE in label or label in ('手机：', '手机'):
+                        if value and not mobile:
+                            mobile = self._cleanPhone(value)
+                    elif LABEL_FAX in label or label in ('传真：', '传真'):
+                        if value and not fax:
+                            fax = self._cleanPhone(value)
+
+                if any([tel, mobile, fax, address]):
+                    break
+        except Exception:
+            pass
+        return tel, mobile, fax, address
+
+    def _extractFromDlDtDd(self) -> tuple[str, str, str, str, str]:
+        """从 dl > dt + dd 配对中提取联系信息。"""
+        member_name = tel = mobile = fax = address = ''
+        try:
+            dts = self.driver.find_elements(By.TAG_NAME, 'dt')
             for dt in dts:
                 label = (dt.text or '').strip()
                 try:
@@ -449,1185 +1084,463 @@ def extractContactByDom(driver):
                     value = ''
                 if not value:
                     continue
+
                 if LABEL_CONTACT in label or label == '联系人':
                     member_name = value[:30]
                 elif LABEL_TEL in label or label == '电话':
-                    digits = re.sub(r'\s+', ' ', re.sub(r'[^\d\-]', '', value)).strip()
+                    digits = self._cleanPhone(value)
                     if len(re.sub(r'[^\d]', '', digits)) >= 5:
-                        tel = digits[:50]
+                        tel = digits
                 elif LABEL_MOBILE in label or label == '手机':
-                    digits = re.sub(r'\s+', ' ', re.sub(r'[^\d\-]', '', value)).strip()
+                    digits = self._cleanPhone(value)
                     if len(re.sub(r'[^\d]', '', digits)) >= 5:
-                        mobile = digits[:50]
+                        mobile = digits
                 elif LABEL_FAX in label or label == '传真':
-                    digits = re.sub(r'\s+', ' ', re.sub(r'[^\d\-]', '', value)).strip()
+                    digits = self._cleanPhone(value)
                     if digits:
-                        fax = digits[:50]
+                        fax = digits
                 elif LABEL_ADDRESS in label or label == '地址':
                     address = value[:MAX_ADDRESS_LEN]
-        # 方法2：通过 class 含关键词的块（tel/phone/contact/address/member）
-        if not member_name or not tel or not address:
-            for xpath_label, key in [
-                ("//*[contains(@class,'member') or contains(@class,'contact-name')]", 'member'),
-                ("//*[contains(@class,'tel') or contains(@class,'phone')]", 'tel'),
-                ("//*[contains(@class,'address') or contains(@class,'addr')]", 'address'),
-            ]:
-                try:
-                    els = driver.find_elements(By.XPATH, xpath_label)
-                    for el in els:
-                        t = (el.text or '').strip()
-                        if not t or len(t) > 300:
-                            continue
-                        if key == 'member' and not member_name and re.match(r'^[\u4e00-\u9fa5a-zA-Z\s]{2,20}$', t):
-                            member_name = t[:30]
-                            break
-                        if key == 'tel' and not tel and re.search(r'\d{5,}', t):
-                            tel = re.sub(r'\s+', '-', re.sub(r'[^\d\-]', '', t))[:50] or t[:50]
-                            break
-                        if key == 'address' and not address:
-                            address = t[:MAX_ADDRESS_LEN]
-                            break
-                except Exception:
-                    pass
-        # 方法3：整段文本中带「联系人：」「电话：」「手机：」「传真：」「地址：」的块
-        if not member_name or not tel or not mobile or not fax or not address:
-            full_body = (driver.find_element(By.TAG_NAME, 'body').text or '')
-            if not member_name:
-                rm = PATTERN_CONTACT_LABEL.search(full_body)
-                if rm:
-                    member_name = rm.group(1).strip()[:30]
-            if not tel:
-                rm = PATTERN_TEL.search(full_body)
-                if rm:
-                    tel = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', rm.group(1))).strip()[:50]
-            if not mobile:
-                rm = PATTERN_MOBILE.search(full_body)
-                if rm:
-                    mobile = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', rm.group(1))).strip()[:50]
-            if not fax:
-                rm = PATTERN_FAX.search(full_body)
-                if rm:
-                    fax = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', rm.group(1))).strip()[:50]
-            if not address:
-                rm = PATTERN_ADDRESS.search(full_body)
-                if rm:
-                    address = rm.group(1).strip()[:MAX_ADDRESS_LEN]
-                if not address:
-                    rm = PATTERN_ADDRESS_SIMPLE.search(full_body)
-                    if rm:
-                        address = rm.group(1).strip()[:MAX_ADDRESS_LEN]
-    except Exception:
-        pass
-    return (member_name or '', tel or '', mobile or '', fax or '', address or '')
-
-
-def extractContactByRegex(page_text):
-    """
-    从页面纯文本中用正则提取联系人、电话、手机、传真、地址。用于 DOM 取不到时的兜底。
-    返回 (member_name, tel, mobile, fax, address)，未找到的项为 ''。
-    """
-    member_name = ''
-    tel = ''
-    mobile = ''
-    fax = ''
-    address = ''
-    if not (page_text or '').strip():
-        return ('', '', '', '', '')
-    text = page_text
-    # 联系人：优先「联系人：xxx」
-    m = PATTERN_CONTACT_LABEL.search(text)
-    if m:
-        member_name = m.group(1).strip()
-        member_name = re.sub(r'[\s\d].*', '', member_name)[:20]
-    if not member_name:
-        m = PATTERN_CONTACT_SUFFIX.search(text)
-        if m:
-            # 正则只有一组捕获（中文名），(?:先生|女士|...) 为非捕获组，无 group(2)
-            member_name = m.group(1).strip()[:30]
-    # 电话
-    m = PATTERN_TEL.search(text)
-    if m:
-        tel = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
-    # 手机
-    m = PATTERN_MOBILE.search(text)
-    if m:
-        mobile = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
-    # 传真
-    m = PATTERN_FAX.search(text)
-    if m:
-        fax = re.sub(r'[\s\u00a0]+', ' ', re.sub(r'[^\d\-]', '', m.group(1))).strip()[:50]
-    # 地址
-    m = PATTERN_ADDRESS.search(text)
-    if m:
-        address = m.group(1).strip()
-    if not address:
-        m = PATTERN_ADDRESS_SIMPLE.search(text)
-        if m:
-            address = m.group(1).strip()
-    address = (address or '')[:MAX_ADDRESS_LEN]
-    return (member_name or '', tel or '', mobile or '', fax or '', address or '')
-
-
-# 创建浏览器驱动：优先使用 undetected-chromedriver（从底层 patch Chrome 二进制以绕过反自动化检测），
-# 不可用时退化到普通 Selenium Chrome + 手动反检测配置，最后兜底 Firefox
-def createBrowserDriver():
-    """
-    优先使用 undetected-chromedriver 创建浏览器实例，从底层 patch chromedriver 二进制，
-    彻底规避 navigator.webdriver / $cdc_ 变量等自动化指纹检测。
-    若 uc 不可用则依次退化到普通 Selenium Chrome（含手动反检测配置）和 Firefox。
-    """
-    # 方案1（推荐）：undetected-chromedriver —— 底层 patch，反检测效果最好
-    try:
-        options = uc.ChromeOptions()
-        # 禁用 Blink 引擎的 AutomationControlled 特征（uc 已内置处理，这里双重保险）
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        # 设置中文语言环境，与真实用户一致
-        options.add_argument('--lang=zh-CN')
-        driver = uc.Chrome(options=options)
-        print('使用浏览器: Chrome（undetected-chromedriver，已启用底层反检测）')
-        return driver
-    except Exception as e_uc:
-        print(f'undetected-chromedriver 启动失败: {str(e_uc)[:80]}，尝试普通 Chrome...')
-
-    # 方案2（退化）：普通 Selenium Chrome + 手动反检测配置
-    try:
-        options = webdriver.ChromeOptions()
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_experimental_option('excludeSwitches', ['enable-automation'])
-        options.add_experimental_option('useAutomationExtension', False)
-        driver = webdriver.Chrome(options=options)
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            if (!window.chrome) {
-                window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-            }
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters)
-            );
-        """})
-        print('使用浏览器: Chrome（普通 Selenium + 手动反检测配置）')
-        return driver
-    except Exception as e_chrome:
-        print(f'普通 Chrome 也不可用: {str(e_chrome)[:50]}，尝试 Firefox...')
-
-    # 方案3（兜底）：Firefox
-    try:
-        driver = webdriver.Firefox()
-        print('使用浏览器: Firefox（兜底方案）')
-        return driver
-    except Exception as e_ff:
-        raise RuntimeError(
-            f'所有浏览器均不可用。uc: {e_uc}; Chrome: {e_chrome}; Firefox: {e_ff}'
-        ) from e_ff
-
-
-def buildOutputFileName():
-    """
-    根据当前日期时间、搜索关键词和地区构造导出 Excel 文件名。
-    文件命名格式：YYYYMMDD_HHMMSS_搜索内容_地区.excel，例如：20260309_153045_五金_广东广州.excel。
-    若未设置地区，则地区部分使用「全国」。
-    """
-    try:
-        # 构造时间部分：精确到秒，方便区分多次运行
-        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 构造地区部分：省 + 市，如「广东广州」，未配置时使用「全国」
-        region_parts = []
-        if TARGET_REGION:
-            region_parts.append(TARGET_REGION)
-        region_desc = ''.join(region_parts) if region_parts else '全国'
-        # 构造搜索内容部分：展示前几个关键词 + 总数，避免文件名过长
-        MAX_SHOW_KEYWORDS = 3
-        if SEARCH_KEYWORDS_LIST:
-            shown = '+'.join(SEARCH_KEYWORDS_LIST[:MAX_SHOW_KEYWORDS])
-            if len(SEARCH_KEYWORDS_LIST) > MAX_SHOW_KEYWORDS:
-                keywords_part = f"{shown}等{len(SEARCH_KEYWORDS_LIST)}个"
-            else:
-                keywords_part = shown
-        else:
-            keywords_part = '未命名'
-        keywords_part = keywords_part.replace(' ', '')
-        # 最终文件名：日期时间_搜索内容_地区.xlsx
-        return f"{now_str}_{keywords_part}_{region_desc}.xlsx"
-    except Exception:
-        # 兜底：如果拼接出错，退回原来的前缀 + 时间命名方式
-        return f"{OUTPUT_EXCEL_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-
-def _findElementBySelectors(driver, selectors):
-    """
-    按优先级依次尝试 CSS 选择器列表，返回第一个可见且可交互的元素。
-    找不到则返回 None。
-    """
-    for sel in selectors:
-        try:
-            els = driver.find_elements(By.CSS_SELECTOR, sel)
-            for el in els:
-                if el.is_displayed() and el.size.get('width', 0) > 0:
-                    return el
-        except Exception:
-            continue
-    return None
-
-
-def _generateHumanTrack(distance):
-    """
-    生成模拟人类拖拽的轨迹点列表（先加速后减速，带随机抖动）。
-    返回 [(dx, dy, dt_ms), ...] 的列表，其中：
-      dx = 本步 X 方向位移像素
-      dy = 本步 Y 方向垂直抖动像素
-      dt_ms = 本步暂停毫秒数
-    使用缓动函数让滑块运动更接近真人，降低被风控识别为机器人的概率。
-    """
-    tracks = []
-    current = 0
-    # 将距离分为加速段（前 70%）和减速段（后 30%），模拟人类操作习惯
-    accel_distance = distance * 0.7
-    decel_distance = distance * 0.3
-    # 加速段：步长逐渐增大
-    t = 0.0
-    while current < accel_distance:
-        t += random.uniform(0.02, 0.04)
-        # 使用 ease-in 曲线（二次方加速）
-        progress = min(t / 0.5, 1.0)
-        step = max(1, int(random.uniform(2, 6) * (1 + progress * 2)))
-        if current + step > accel_distance:
-            step = max(1, int(accel_distance - current))
-        dy = random.choice([-1, 0, 0, 0, 1])
-        dt = random.randint(SLIDER_STEP_MIN_MS, SLIDER_STEP_MAX_MS)
-        tracks.append((step, dy, dt))
-        current += step
-
-    # 减速段：步长逐渐减小，末尾精细调整
-    remaining = distance - current
-    while remaining > 0:
-        step = max(1, int(remaining * random.uniform(0.15, 0.4)))
-        if step > remaining:
-            step = max(1, int(remaining))
-        dy = random.choice([0, 0, 0, -1, 1])
-        dt = random.randint(SLIDER_STEP_MAX_MS, SLIDER_STEP_MAX_MS * 3)
-        tracks.append((step, dy, dt))
-        remaining -= step
-
-    return tracks
-
-
-def _humanLikeDrag(driver, slider_el, distance):
-    """
-    模拟人类操作方式拖拽滑块元素到指定距离。
-    1. 先将鼠标移到滑块上方，短暂停顿
-    2. 按住鼠标左键
-    3. 按照 _generateHumanTrack 生成的轨迹逐步移动（带随机抖动和变速）
-    4. 到达终点后短暂停顿再松手，模拟真人确认动作
-    """
-    action = ActionChains(driver)
-    # 移到滑块中心并短暂悬停
-    action.move_to_element(slider_el)
-    action.pause(random.uniform(0.3, 0.6))
-    action.click_and_hold(slider_el)
-    action.pause(random.uniform(0.1, 0.25))
-
-    # 按轨迹逐步拖拽
-    track = _generateHumanTrack(distance)
-    for dx, dy, dt_ms in track:
-        action.move_by_offset(dx, dy)
-        action.pause(dt_ms / 1000.0)
-
-    # 到达终点后短暂停顿再释放，模拟真人确认行为
-    action.pause(random.uniform(0.3, 0.8))
-    action.release()
-    action.perform()
-
-
-def _switchToSliderIframe(driver):
-    """
-    尝试切换到滑块验证码所在的 iframe（1688 baxia 验证码经常嵌套在 iframe 中）。
-    返回 True 表示成功切换到 iframe，False 表示未找到相关 iframe（滑块可能在主页面）。
-    """
-    for sel in SLIDER_IFRAME_SELECTORS:
-        try:
-            iframes = driver.find_elements(By.CSS_SELECTOR, sel)
-            for iframe in iframes:
-                if iframe.is_displayed():
-                    driver.switch_to.frame(iframe)
-                    return True
-        except Exception:
-            continue
-    # 通用兜底：遍历页面上所有 iframe 逐个尝试
-    try:
-        all_iframes = driver.find_elements(By.TAG_NAME, 'iframe')
-        for iframe in all_iframes:
-            try:
-                if not iframe.is_displayed():
-                    continue
-                driver.switch_to.frame(iframe)
-                # 进入 iframe 后检查是否存在滑块元素
-                slider = _findElementBySelectors(driver, SLIDER_BTN_SELECTORS)
-                if slider:
-                    return True
-                # 没找到则切回主页面继续尝试下一个 iframe
-                driver.switch_to.default_content()
-            except Exception:
-                try:
-                    driver.switch_to.default_content()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return False
-
-
-def _tryAutoSolveCaptcha(driver):
-    """
-    尝试自动拖拽滑块验证码。
-    先在主页面查找滑块，找不到则尝试切入 iframe 查找。
-    找到后用模拟人类行为的方式拖拽滑块，最多重试 SLIDER_MAX_RETRY 次。
-    返回 True 表示执行了拖拽操作（不保证验证一定通过），False 表示未找到滑块。
-    """
-    in_iframe = False
-
-    for attempt in range(SLIDER_MAX_RETRY):
-        # 确保先回到主页面
-        try:
-            driver.switch_to.default_content()
         except Exception:
             pass
-        in_iframe = False
+        return member_name, tel, mobile, fax, address
 
-        # 第一步：在主页面查找滑块
-        slider = _findElementBySelectors(driver, SLIDER_BTN_SELECTORS)
-        track = _findElementBySelectors(driver, SLIDER_TRACK_SELECTORS)
-
-        # 第二步：主页面没找到，尝试切入 iframe
-        if not slider:
-            if _switchToSliderIframe(driver):
-                in_iframe = True
-                slider = _findElementBySelectors(driver, SLIDER_BTN_SELECTORS)
-                track = _findElementBySelectors(driver, SLIDER_TRACK_SELECTORS)
-
-        if not slider:
-            print(f'  ⚠ 自动拖拽：未找到滑块元素（第 {attempt + 1} 次）')
-            time.sleep(1)
-            continue
-
-        # 计算拖拽距离：优先用轨道宽度减去滑块宽度，否则用默认值
-        if track:
-            distance = track.size.get('width', SLIDER_DEFAULT_DISTANCE) - slider.size.get('width', 40)
-            distance = max(distance, 100)
-        else:
-            distance = SLIDER_DEFAULT_DISTANCE
-
-        # 每次重试时略微调整距离，避免完全一致的轨迹被检测
-        jitter = random.randint(-10, 10)
-        distance = max(100, distance + jitter)
-
-        print(f'  → 自动拖拽滑块（第 {attempt + 1} 次，距离 {distance}px）...')
-
-        try:
-            _humanLikeDrag(driver, slider, distance)
-        except Exception as e:
-            print(f'  ⚠ 拖拽操作异常: {e}')
-
-        # 拖拽后切回主页面
-        if in_iframe:
+    def _extractFromClassKeywords(self) -> tuple[str, str, str]:
+        """通过 class 含关键词的块提取联系人、电话、地址。"""
+        member_name = tel = address = ''
+        field_map = [
+            ("//*[contains(@class,'member') or contains(@class,'contact-name')]", 'member'),
+            ("//*[contains(@class,'tel') or contains(@class,'phone')]", 'tel'),
+            ("//*[contains(@class,'address') or contains(@class,'addr')]", 'address'),
+        ]
+        for xpath, key in field_map:
             try:
-                driver.switch_to.default_content()
+                for el in self.driver.find_elements(By.XPATH, xpath):
+                    t = (el.text or '').strip()
+                    if not t or len(t) > 300:
+                        continue
+                    if key == 'member' and not member_name and re.match(r'^[\u4e00-\u9fa5a-zA-Z\s]{2,20}$', t):
+                        member_name = t[:30]
+                        break
+                    if key == 'tel' and not tel and re.search(r'\d{5,}', t):
+                        tel = re.sub(r'\s+', '-', re.sub(r'[^\d\-]', '', t))[:50] or t[:50]
+                        break
+                    if key == 'address' and not address:
+                        address = t[:MAX_ADDRESS_LEN]
+                        break
+            except Exception:
+                pass
+        return member_name, tel, address
+
+    @staticmethod
+    def _cleanPhone(raw: str) -> str:
+        """清洗电话号码字符串，仅保留数字和横线。"""
+        return re.sub(r'\s+', ' ', re.sub(r'[^\d\-\s]', '', raw)).strip()[:50]
+
+    # ── 弹窗处理 ─────────────────────────────────────────
+
+    def _closeKnownPopups(self):
+        """关闭已知冗余弹窗（baxia 遮罩/对话框），不关闭滑块验证框。"""
+        try:
+            self.driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+            self.driver.execute_script(JS_REMOVE_BAXIA_MASK)
+            self.driver.execute_script(JS_REMOVE_BAXIA_DIALOG)
+        except Exception:
+            pass
+
+    def _closeAccessDeniedPopup(self) -> bool:
+        """
+        检测并尝试关闭「亲，访问被拒绝」弹窗。
+        关闭后进行冷却等待并刷新页面。返回 True 表示曾检测到该弹窗。
+        """
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, 'body').text or ''
+            if TEXT_ACCESS_DENIED not in body_text:
+                return False
+
+            print('检测到「访问被拒绝」弹窗，进入冷却等待...')
+            closed = False
+            for _ in range(MAX_ACCESS_DENIED_CLOSE_ATTEMPTS):
+                try:
+                    deny_els = self.driver.find_elements(
+                        By.XPATH, f"//*[contains(text(),'{TEXT_ACCESS_DENIED}')]"
+                    )
+                    for el in deny_els:
+                        try:
+                            parent = el.find_element(
+                                By.XPATH,
+                                "./ancestor::*[contains(@class,'dialog') or "
+                                "contains(@class,'modal') or contains(@class,'popup')][1]"
+                            )
+                            close_btns = parent.find_elements(
+                                By.XPATH,
+                                ".//*[contains(@class,'close') or text()='×' or "
+                                "text()='关闭' or contains(text(),'×')]"
+                            )
+                            if close_btns:
+                                self.driver.execute_script('arguments[0].click();', close_btns[0])
+                                closed = True
+                                time.sleep(1)
+                                break
+                        except Exception:
+                            pass
+                    if closed:
+                        break
+
+                    script = f"""
+                    var text = '{TEXT_ACCESS_DENIED}';
+                    var all = document.querySelectorAll('div, section');
+                    for (var i = all.length - 1; i >= 0; i--) {{
+                        var el = all[i];
+                        if (el.innerText && el.innerText.indexOf(text) !== -1) {{
+                            var p = el.closest('.dialog') || el.closest('.modal')
+                                || el.closest('[class*="dialog"]') || el.closest('[class*="modal"]')
+                                || el.parentElement;
+                            if (p) {{ p.remove(); return true; }}
+                        }}
+                    }}
+                    return false;
+                    """
+                    if self.driver.execute_script(script):
+                        closed = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            cooldown = random.uniform(ACCESS_DENIED_COOLDOWN_MIN, ACCESS_DENIED_COOLDOWN_MAX)
+            print(f'冷却等待 {cooldown:.0f} 秒后刷新...')
+            time.sleep(cooldown)
+            try:
+                self.driver.refresh()
+                time.sleep(random.uniform(3, 5))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    # ── 滑块验证码处理 ───────────────────────────────────
+
+    def _waitCaptchaResolved(self) -> tuple[bool, int]:
+        """
+        检测并尝试自动解决滑块验证码，失败后等待手动操作。
+        返回 (是否通过, 等待秒数)。
+        """
+        start = time.time()
+        if not self._detectCaptcha():
+            return True, 0
+
+        print('检测到滑块验证码，尝试自动拖拽...')
+        self._closeKnownPopups()
+
+        # 尝试自动拖拽
+        try:
+            if self._tryAutoSolveCaptcha() and not self._detectCaptcha():
+                return True, int(time.time() - start)
+        except Exception as e:
+            print(f'自动拖拽出错: {e}')
+            try:
+                self.driver.switch_to.default_content()
             except Exception:
                 pass
 
-        # 等待一会让页面响应验证结果
-        time.sleep(random.uniform(1.5, 3.0))
+        # 回退到手动操作
+        if self._detectCaptcha():
+            print('自动拖拽未通过，请在浏览器中手动完成验证...')
+            wait_captcha = WebDriverWait(
+                self.driver, self.config.captcha_timeout, poll_frequency=3.0
+            )
 
-        # 检查验证码是否已消失
-        if not _detectCaptcha(driver):
-            print(f'  ✓ 自动拖拽验证通过！')
+            def _gone(d):
+                if self._detectCaptcha():
+                    self._closeKnownPopups()
+                    return False
+                return True
+
+            try:
+                wait_captcha.until(_gone)
+                return True, int(time.time() - start)
+            except Exception:
+                return False, int(time.time() - start)
+
+        return True, int(time.time() - start)
+
+    def _detectCaptcha(self) -> bool:
+        """检测当前页面是否存在滑块验证码。"""
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, 'body').text or ''
+        except Exception:
+            body_text = ''
+
+        captcha_keywords = ['slide to verify', '滑动验证', '拖动', '完成验证']
+        if any(kw in body_text.lower() for kw in captcha_keywords):
             return True
 
-        print(f'  ⚠ 第 {attempt + 1} 次自动拖拽未通过验证，等待后重试...')
-        time.sleep(random.uniform(2.0, 4.0))
-
-        # 验证失败后，某些情况下 1688 会刷新滑块，需要等待新滑块加载
         try:
-            # 尝试点击"刷新"或重置按钮（部分验证码弹窗有此按钮）
-            refresh_selectors = ['.nc-lang-cnt .errloading a', '.errloading a', '#nc_1_refresh1', '.btn_reload']
-            refresh_btn = _findElementBySelectors(driver, refresh_selectors)
-            if refresh_btn:
-                refresh_btn.click()
+            for el in self.driver.find_elements(By.CSS_SELECTOR, '.baxia-dialog'):
+                text = (el.text or '').strip()
+                if text and ('拖动' in text or '验证' in text or 'slide' in text.lower()):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _tryAutoSolveCaptcha(self) -> bool:
+        """尝试自动拖拽滑块，最多重试 SLIDER_MAX_RETRY 次。"""
+        for attempt in range(SLIDER_MAX_RETRY):
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+
+            slider = self._findBySelectors(SLIDER_BTN_SELECTORS)
+            track = self._findBySelectors(SLIDER_TRACK_SELECTORS)
+
+            # 主页面没找到，尝试切入 iframe
+            in_iframe = False
+            if not slider:
+                if self._switchToSliderIframe():
+                    in_iframe = True
+                    slider = self._findBySelectors(SLIDER_BTN_SELECTORS)
+                    track = self._findBySelectors(SLIDER_TRACK_SELECTORS)
+
+            if not slider:
+                time.sleep(1)
+                continue
+
+            distance = self._calcSliderDistance(slider, track)
+            jitter = random.randint(-10, 10)
+            distance = max(100, distance + jitter)
+            print(f'自动拖拽滑块（第 {attempt + 1} 次，距离 {distance}px）')
+
+            try:
+                self._humanLikeDrag(slider, distance)
+            except Exception as e:
+                print(f'拖拽操作异常: {e}')
+
+            if in_iframe:
+                try:
+                    self.driver.switch_to.default_content()
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(1.5, 3.0))
+
+            if not self._detectCaptcha():
+                print('自动拖拽验证通过！')
+                return True
+
+            time.sleep(random.uniform(2.0, 4.0))
+            self._clickSliderRefresh()
+
+        return False
+
+    def _calcSliderDistance(self, slider, track) -> int:
+        """计算滑块拖拽距离：优先用轨道宽度，否则用默认值。"""
+        if track:
+            dist = track.size.get('width', SLIDER_DEFAULT_DISTANCE) - slider.size.get('width', 40)
+            return max(dist, 100)
+        return SLIDER_DEFAULT_DISTANCE
+
+    def _clickSliderRefresh(self):
+        """尝试点击滑块刷新/重置按钮。"""
+        try:
+            btn = self._findBySelectors([
+                '.nc-lang-cnt .errloading a', '.errloading a',
+                '#nc_1_refresh1', '.btn_reload',
+            ])
+            if btn:
+                btn.click()
                 time.sleep(random.uniform(1.0, 2.0))
         except Exception:
             pass
 
-    return False
-
-
-def _detectCaptcha(driver):
-    """通过 body 文本和 baxia-dialog 元素双重检测当前页面是否存在滑块验证码。"""
-    try:
-        body_text = driver.find_element(By.TAG_NAME, 'body').text or ''
-    except Exception:
-        body_text = ''
-    if (
-        'slide to verify' in body_text.lower()
-        or '滑动验证' in body_text
-        or '拖动' in body_text
-        or '完成验证' in body_text
-    ):
-        return True
-    # 检测 baxia-dialog 元素是否含验证码内容（弹窗 DOM 文字可能不在 body.text 中）
-    try:
-        baxia_els = driver.find_elements(By.CSS_SELECTOR, '.baxia-dialog')
-        for bel in baxia_els:
-            btext = (bel.text or '').strip()
-            if btext and ('拖动' in btext or '验证' in btext or 'slide' in btext.lower()):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def waitCaptchaResolved(driver):
-    """
-    检测并尝试自动解决滑块验证码，失败后回退到等待手动操作。
-    流程：
-      1. 检测是否存在验证码
-      2. 先尝试自动拖拽滑块（最多 SLIDER_MAX_RETRY 次）
-      3. 自动拖拽失败后，等待用户手动完成（在 CAPTCHA_WAIT_TIMEOUT 内轮询）
-    返回 (resolved, waited_seconds)：
-    - resolved 为 True 表示验证码已消失；
-    - resolved 为 False 表示在超时时间内验证码仍存在。
-    """
-    start_ts = time.time()
-    if not _detectCaptcha(driver):
-        return True, 0
-
-    print('  ⚠ 检测到滑块验证码，尝试自动拖拽...')
-    # 先尝试关闭其他已知弹窗，避免遮挡验证码区域
-    try:
-        closeKnownPopups(driver)
-    except Exception:
-        pass
-
-    # 尝试自动拖拽滑块
-    try:
-        auto_solved = _tryAutoSolveCaptcha(driver)
-        if auto_solved and not _detectCaptcha(driver):
-            waited = int(time.time() - start_ts)
-            return True, waited
-    except Exception as e:
-        print(f'  ⚠ 自动拖拽过程出错: {e}')
-        # 确保切回主页面
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-
-    # 自动拖拽未通过，回退到等待手动操作
-    if _detectCaptcha(driver):
-        print('  ⚠ 自动拖拽未能通过验证，请在浏览器中手动拖动滑块完成验证，脚本自动等待...')
-        wait_captcha = WebDriverWait(driver, CAPTCHA_WAIT_TIMEOUT, poll_frequency=3.0)
-
-        def _captcha_gone(d):
-            """内部轮询函数：当页面上不再包含验证码提示文案时返回 True。"""
-            if _detectCaptcha(d):
-                try:
-                    closeKnownPopups(d)
-                except Exception:
-                    pass
-                return False
-            return True
-
-        try:
-            wait_captcha.until(_captcha_gone)
-            waited = int(time.time() - start_ts)
-            return True, waited
-        except Exception:
-            waited = int(time.time() - start_ts)
-            return False, waited
-
-    waited = int(time.time() - start_ts)
-    return True, waited
-
-
-
-def scrollToBottom(driver):
-    """
-    将当前页面平滑滚动到底部。
-    使用 window.scrollTo + document.body.scrollHeight，避免依赖固定像素高度（如 30000）导致某些分辨率下无法完全滚动到底部。
-    """
-    try:
-        driver.execute_script(
-            "window.scrollTo({top: document.body.scrollHeight, behavior: 'auto'});"
-        )
-    except Exception:
-        try:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        except Exception:
-            pass
-
-
-# 每次渐进滚动的步长（像素），值越小滚动越平滑但耗时越长
-SCROLL_STEP_PX = 600
-# 每次滚动后等待懒加载内容渲染的时间（秒）
-SCROLL_STEP_WAIT = 0.5
-# 渐进滚动完成后的额外等待时间（秒），确保最后一批懒加载内容完成渲染
-SCROLL_FINAL_WAIT = 1.5
-# 期望每页商家数量，滚动加载过程中达到此数量即可提前结束
-EXPECTED_ITEMS_PER_PAGE = 20
-
-
-def scrollToLoadAllResults(driver):
-    """
-    渐进式滚动当前页面，触发 1688 搜索结果页的懒加载，确保所有商家卡片都被渲染到 DOM 中。
-
-    1688 翻页后仅渲染视口内可见的少量结果（通常 6 条左右），
-    其余商家需要页面滚动到对应位置后才会异步加载并插入 DOM。
-    此函数从页面顶部开始，以固定步长（SCROLL_STEP_PX）逐步向下滚动，
-    每步等待 SCROLL_STEP_WAIT 秒让懒加载内容渲染，直到滚动到页面底部。
-    若中途检测到商家数量已达 EXPECTED_ITEMS_PER_PAGE，提前结束滚动。
-    """
-    try:
-        # 先回到页面顶部，确保从头开始滚动
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.3)
-
-        total_height = driver.execute_script("return document.body.scrollHeight;")
-        current_pos = 0
-
-        while current_pos < total_height:
-            current_pos += SCROLL_STEP_PX
-            driver.execute_script(f"window.scrollTo(0, {current_pos});")
-            time.sleep(SCROLL_STEP_WAIT)
-
-            # 滚动过程中检查已加载的商家数量，达到预期即可提前结束
+    def _switchToSliderIframe(self) -> bool:
+        """尝试切换到滑块验证码所在的 iframe。"""
+        for sel in SLIDER_IFRAME_SELECTORS:
             try:
-                loaded_count = len(driver.find_elements(By.CSS_SELECTOR, "a.company-name"))
-                if loaded_count >= EXPECTED_ITEMS_PER_PAGE:
-                    break
+                for iframe in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if iframe.is_displayed():
+                        self.driver.switch_to.frame(iframe)
+                        return True
             except Exception:
-                pass
+                continue
 
-            # 页面高度可能因懒加载而动态增长，需要重新获取
-            try:
-                total_height = driver.execute_script("return document.body.scrollHeight;")
-            except Exception:
-                pass
-
-        # 最后滚动到底部并等待一段时间，确保末尾的懒加载内容也完成渲染
-        scrollToBottom(driver)
-        time.sleep(SCROLL_FINAL_WAIT)
-
-        # 滚回顶部，方便后续按视觉顺序采集
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.3)
-    except Exception:
-        pass
-
-
-def getCityListByProvince(driver, province_name, keyword):
-    """
-    根据指定省份，自动解析 1688 搜索页「所在地区」筛选中的城市列表顺序。
-
-    设计目标：
-    1. 省份固定时，只要修改 TARGET_REGION，脚本即可按「从上到下，从左到右」的视觉顺序依次抓取该省下所有城市。
-    2. 通过元素在页面中的位置信息（top、left）进行排序，尽量贴合实际展示顺序。
-
-    参数说明：
-    - driver: 已登录状态下的 Selenium WebDriver 实例。
-    - province_name: 省份名称，如「广东」「浙江」等。
-    - keyword: 搜索关键词，用于构造搜索页 URL 以获取城市列表。
-
-    返回值：
-    - 返回城市名称字符串列表，例如 ["广州", "惠州", "江门", "深圳", ...]。
-      若解析失败，返回空列表，调用方需自行兜底（例如退化为整省不分市抓取）。
-    """
-    city_list = []
-    # 第 0 步：若该省在预置映射中，优先直接返回预置城市列表，避免因 DOM 结构变更导致解析失败
-    try:
-        preset_cities = PROVINCE_CITY_MAP.get(province_name)
-        if preset_cities:
-            print(f'省份「{province_name}」使用预置城市列表: {preset_cities}')
-            return list(preset_cities)
-    except Exception:
-        pass
-    try:
-        # 构造仅指定省份、不指定城市的搜索 URL
-        base_url = (
-            'https://s.1688.com/company/company_search.htm?'
-            'keywords=' + quote(keyword, encoding='gbk', safe='')
-            + '&n=y&spm=a260k.635.1998096057.d1'
-            + '&province=' + quote(province_name, encoding='gbk', safe='')
-        )
-        driver.get(base_url)
-        # 等待页面关键筛选区域加载完成（所在地区筛选）
+        # 通用兜底：遍历所有 iframe
         try:
-            temp_wait = WebDriverWait(driver, 20)
-            temp_wait.until(
-                EC.presence_of_all_elements_located(
-                    (By.CSS_SELECTOR, "div.sm-widget-address, div.sm-widget-region, div.address-widget")
-                )
-            )
-        except Exception:
-            # 即使等待失败，也继续尝试查找元素，避免因为 DOM 结构差异导致直接中断
-            pass
-
-        # 有些情况下城市列表需要鼠标悬停「广东」省份才能展开，
-        # 这里尝试点击一次对应省份的链接，促使右侧城市列表弹出。
-        try:
-            province_elems = driver.find_elements(
-                By.XPATH,
-                "//*[text()='" + province_name + "']"
-            )
-            for prov in province_elems:
+            for iframe in self.driver.find_elements(By.TAG_NAME, 'iframe'):
                 try:
-                    driver.execute_script("arguments[0].click();", prov)
-                    time.sleep(1)
-                    break
+                    if not iframe.is_displayed():
+                        continue
+                    self.driver.switch_to.frame(iframe)
+                    if self._findBySelectors(SLIDER_BTN_SELECTORS):
+                        return True
+                    self.driver.switch_to.default_content()
                 except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # 在地区筛选区域内查找所有城市链接元素。
-        # 第 1 步：优先在「所在地区」组件常见容器内查找；
-        # 第 2 步：若未找到，则退化为全局查找带 &city= 参数的公司搜索链接，进一步放宽条件。
-        candidate_city_elements = []
-        try:
-            containers = driver.find_elements(
-                By.XPATH,
-                "//div[contains(@class,'sm-widget-address') or contains(@class,'sm-widget-region') or contains(@class,'address-widget')]"
-            )
-            for container in containers:
-                links = container.find_elements(By.TAG_NAME, "a")
-                for link in links:
-                    text_val = (link.text or '').strip()
-                    # 城市名通常为 1~6 个中文字符，排除「不限」「全部」「全国」等无效项
-                    if not text_val:
-                        continue
-                    if text_val in ('不限', '全部', '全国'):
-                        continue
-                    if not re.match(r'^[\u4e00-\u9fa5]{1,6}$', text_val):
-                        continue
                     try:
-                        rect = driver.execute_script(
-                            "var r = arguments[0].getBoundingClientRect(); return [r.top, r.left];",
-                            link,
-                        )
-                        top_pos = float(rect[0]) if rect and len(rect) >= 1 else 0.0
-                        left_pos = float(rect[1]) if rect and len(rect) >= 2 else 0.0
-                    except Exception:
-                        top_pos = 0.0
-                        left_pos = 0.0
-                    candidate_city_elements.append((top_pos, left_pos, text_val))
-        except Exception:
-            candidate_city_elements = []
-
-        # 若在常见容器中未找到城市元素，则进一步做一次全局兜底：
-        # 1. href 中包含 company_search.htm 与 &city=；
-        # 2. 文本为 1~6 个中文字符，排除「不限」「全部」「全国」等。
-        if not candidate_city_elements:
-            try:
-                all_links = driver.find_elements(By.XPATH, "//a[@href and contains(@href,'company_search.htm') and contains(@href,'city=')]")
-                for link in all_links:
-                    text_val = (link.text or '').strip()
-                    if not text_val:
-                        continue
-                    if text_val in ('不限', '全部', '全国'):
-                        continue
-                    if not re.match(r'^[\u4e00-\u9fa5]{1,6}$', text_val):
-                        continue
-                    try:
-                        rect = driver.execute_script(
-                            "var r = arguments[0].getBoundingClientRect(); return [r.top, r.left];",
-                            link,
-                        )
-                        top_pos = float(rect[0]) if rect and len(rect) >= 1 else 0.0
-                        left_pos = float(rect[1]) if rect and len(rect) >= 2 else 0.0
-                    except Exception:
-                        top_pos = 0.0
-                        left_pos = 0.0
-                    candidate_city_elements.append((top_pos, left_pos, text_val))
-            except Exception:
-                candidate_city_elements = []
-
-        if not candidate_city_elements:
-            # 打印一条简单日志，方便你在终端看到当前页面结构是否被成功识别
-            print(f'未在省份「{province_name}」页面上找到城市链接元素，城市列表为空')
-            return []
-
-        # 排序方式：先按 top（从小到大），再按 left（从小到大），
-        # 对应视觉上的「从上到下，从左到右」顺序。
-        candidate_city_elements.sort(key=lambda item: (round(item[0], 1), round(item[1], 1)))
-
-        # 去重并保持顺序
-        seen_names = set()
-        for _, _, name in candidate_city_elements:
-            if name not in seen_names:
-                seen_names.add(name)
-                city_list.append(name)
-    except Exception as e:
-        # 这里仅打印提示，不抛出异常，避免影响后续整体采集流程
-        print(f'自动解析省份「{province_name}」城市列表失败: {e}')
-
-    return city_list
-
-
-# Windows 下 PyInstaller 打包后需要调用 freeze_support 防止多进程异常
-freeze_support()
-
-# 先加载运行参数，再收集用户交互输入，最后创建浏览器驱动
-loadRuntimeConfig()
-collectUserInput()
-driver = createBrowserDriver()
-wait = WebDriverWait(driver, 120)
-
-def buildSearchUrl(keyword, province_name, city_name):
-    """
-    根据关键词、省份与城市构造公司搜索页 URL。
-
-    说明：
-    - keyword 为当前搜索关键词，用 GBK 编码拼入 URL（与 1688 一致）。
-    - 省份固定时，只要切换 city_name，即可依次抓取该省旗下不同城市。
-    - 当 city_name 为空字符串时，表示按整省（不区分城市）进行搜索。
-    """
-    try:
-        base_url = (
-            'https://s.1688.com/company/company_search.htm?'
-            'keywords=' + quote(keyword, encoding='gbk', safe='')
-            + '&n=y&spm=a260k.635.1998096057.d1'
-        )
-        if province_name:
-            base_url = base_url + '&province=' + quote(province_name, encoding='gbk', safe='')
-            if city_name:
-                base_url = base_url + '&city=' + quote(city_name, encoding='gbk', safe='')
-        return base_url
-    except Exception:
-        # 若拼接过程中出错，退回到最基础的关键词搜索 URL
-        return (
-            'https://s.1688.com/company/company_search.htm?'
-            'keywords=' + quote(keyword, encoding='gbk', safe='')
-            + '&n=y&spm=a260k.635.1998096057.d1'
-        )
-
-# ── 扫码登录 ────────────────────────────────────────────
-# 打开淘宝登录页（默认显示扫码界面）
-driver.get('https://login.taobao.com/member/login.jhtml')
-
-print('=' * 50)
-print('请打开手机淘宝 App，扫描浏览器中的二维码完成登录')
-print('等待扫码中（最多等待 120 秒）...')
-print('=' * 50)
-
-# 等待登录成功：检测页面跳转离开登录域名
-try:
-    wait.until(EC.url_contains('taobao.com/'))
-    # 确保不再停留在 login 页面
-    wait.until_not(EC.url_contains('login.taobao.com'))
-    print('登录成功！')
-except Exception:
-    # 超时后检查当前URL，如果已经跳走也算成功
-    if 'login.taobao.com' not in driver.current_url:
-        print('登录成功！')
-    else:
-        print('登录超时，请重新运行脚本并及时扫码')
-        driver.quit()
-        sys.exit(1)
-
-# ── 登录后首次访问 1688，建立会话 Cookie ──────────────────
-# 淘宝登录后浏览器仍在 taobao.com 域，先访问 1688 首页完成跨域 Cookie 同步
-print('正在建立 1688 会话...')
-driver.get('https://www.1688.com/')
-time.sleep(random.uniform(3, 5))
-print('1688 会话已建立')
-
-# ── 根据省份自动生成城市列表 ─────────────────────────────
-if TARGET_REGION:
-    # 自动解析该省下所有城市（从上到下、从左到右）
-    city_list = getCityListByProvince(driver, TARGET_REGION, SEARCH_KEYWORDS_LIST[0])
-    if not city_list:
-        print(f'未能自动解析省份「{TARGET_REGION}」的城市列表，将按整省抓取一次')
-        city_list = ['']
-    else:
-        effective_cities = [c for c in city_list if c]
-        print(f'省份「{TARGET_REGION}」共解析到 {len(effective_cities)} 个城市: {city_list}', flush=True)
-else:
-    # 未指定省份时，仅按全国维度抓取一次
-    city_list = ['']
-
-print(f'本次将按以下城市顺序抓取（空字符串表示整省/全国一次）: {city_list}')
-print(f'本次关键词列表（共 {len(SEARCH_KEYWORDS_LIST)} 个）: {SEARCH_KEYWORDS_LIST}')
-
-# ── 生成 (城市, 关键词) 任务队列 ─────────────────────────
-# 一个城市爬完所有关键词，然后下个城市，以此类推
-task_queue = []
-for _city in city_list:
-    for _kw in SEARCH_KEYWORDS_LIST:
-        task_queue.append((_city, _kw))
-
-print(f'本次共有 {len(task_queue)} 个采集任务（{len(city_list)} 个城市 × {len(SEARCH_KEYWORDS_LIST)} 个关键词）', flush=True)
-
-# 生成带时间戳的输出文件名，避免多次运行覆盖
-OUTPUT_EXCEL = buildOutputFileName()
-# 新建 Excel 工作簿并写入表头
-wb = Workbook()
-ws = wb.active
-ws.title = '采集数据'
-for col, header in enumerate(EXCEL_HEADERS, start=1):
-    ws.cell(row=1, column=col, value=header)
-excel_row = 2
-# 已采集店铺集合（用 shop_origin 去重，避免同一店铺多页/多链接重复写入）
-seen_shops = set()
-# 本次运行已成功采集的商家数量（跨所有城市累计）
-total_shops_collected = 0
-
-# ── 按 (城市, 关键词) 任务队列循环，内层保留原有分页抓取逻辑 ─────────────
-for task_idx, (current_city, current_keyword) in enumerate(task_queue, start=1):
-    search_url = buildSearchUrl(current_keyword, TARGET_REGION, current_city)
-
-    # 打印当前任务进度及搜索 URL（便于排查地区过滤是否生效）
-    city_desc = current_city or '整省/全国'
-    print(f'\n{"=" * 60}')
-    print(f'任务 [{task_idx}/{len(task_queue)}] 关键词「{current_keyword}」城市「{city_desc}」')
-    print(f'{"=" * 60}')
-
-    # 打开对应城市+关键词的搜索首页，主标签页始终保留此搜索结果页；联系页在新建标签中打开，抓完即关
-    driver.get(search_url)
-    if TARGET_REGION:
-        region_desc = TARGET_REGION + (' - ' + current_city if current_city else '')
-        print(f'已设置地区筛选: {region_desc}，搜索关键词: {current_keyword}')
-    else:
-        print(f'未设置地区筛选（全国范围），搜索关键词: {current_keyword}')
-
-    # 主标签句柄：用于采集时在新标签打开联系页，抓完后关闭新标签并切回主标签
-    main_window = driver.current_window_handle
-    # 当前城市下的页面异常计数与控制标记
-    page_error_count = 0
-    stop_collecting = False
-    # 循环抓取每一页，直到没有下一页或达到采集上限
-    page_num = 1
-
-    while True:
-        if stop_collecting:
-            break
-        try:
-            # 每页开始时先关闭已知弹窗，并尝试关闭「亲，访问被拒绝」弹窗以便继续抓取
-            closeKnownPopups(driver)
-            if closeAccessDeniedPopup(driver):
-                print('检测到「访问被拒绝」弹窗，已尝试关闭；若列表仍为空请手动关闭弹窗或稍后重试')
-            # 使用显式等待，确保当前页公司列表元素加载完成，减少直接 find_elements 导致空列表的风险
-            try:
-                wait.until(
-                    EC.presence_of_all_elements_located(
-                        (By.CSS_SELECTOR, "a.company-name")
-                    )
-                )
-            except Exception:
-                pass
-            # 渐进式滚动页面，触发懒加载，确保所有商家卡片都渲染到 DOM 中
-            scrollToLoadAllResults(driver)
-            # 获取当前页企业名称列表
-            title = driver.find_elements(By.CSS_SELECTOR, "a.company-name")
-            # 打印当前页商家数量；若为 0 且页面有「访问被拒绝」提示，给出说明
-            if len(title) == 0:
-                try:
-                    body_text = (driver.find_element(By.TAG_NAME, 'body').text or '')
-                    if TEXT_ACCESS_DENIED in body_text:
-                        print(f'第{page_num}页列表为空，且存在「访问被拒绝」提示，请手动关闭弹窗或扫码验证后重试')
-                    else:
-                        print(f'该关键词在当前城市没有搜索结果（属于正常现象），自动跳到下一个任务')
-                except Exception:
-                    pass
-            print(f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」第{page_num}页找到 {len(title)} 个商家')
-            # 尝试解析分页控件中的总页数：如果当前页数已经等于或超过总页数，则结束当前城市的采集
-            try:
-                pager_text = ''
-                # 常见分页容器 class 名称做一个并集匹配，尽量兼容不同页面结构
-                pager_elements = driver.find_elements(
-                    By.CSS_SELECTOR,
-                    "div.fui-pager, div.sm-pagination, div[class*='pagination'], span.page-count"
-                )
-                for el in pager_elements:
-                    text_val = (el.text or '').strip()
-                    if text_val:
-                        pager_text = text_val
-                        break
-                total_pages = 0
-                if pager_text:
-                    # 兼容类似「1/52」或「第1页/共52页」等样式
-                    m = re.search(r'/\s*(\d+)', pager_text)
-                    if not m:
-                        m = re.search(r'共\s*(\d+)\s*页', pager_text)
-                    if m:
-                        total_pages = int(m.group(1))
-                # 如能解析出总页数，则在日志中打印出来，方便观察当前城市一共多少页
-                if total_pages > 0:
-                    print(
-                        f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」当前搜索结果共 {total_pages} 页',
-                        flush=True
-                    )
-                if total_pages > 0 and page_num >= total_pages:
-                    print(
-                        f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」当前第{page_num}页已达到末页（共 {total_pages} 页），结束该任务'
-                    )
-                    break
-            except Exception:
-                # 分页信息解析失败时不影响正常翻页逻辑
-                pass
-            # 先收集当前页所有商家信息（包含元素本身和其在视口中的垂直位置），避免跳转后引用失效
-            page_data = []
-            for i in range(len(title)):
-                title_el = title[i]
-                title_value = title_el.get_attribute('title') or title_el.text
-                href_value = title_el.get_attribute('href')
-                if not href_value:
-                    continue
-                # 使用 getBoundingClientRect().top 记录当前公司名称链接在页面中的垂直位置，
-                # 后续按该位置排序，保证抓取顺序与页面由上到下的视觉顺序一致。
-                try:
-                    top_pos = driver.execute_script(
-                        "return arguments[0].getBoundingClientRect().top;", title_el
-                    )
-                except Exception:
-                    top_pos = 0
-                # 结构： (垂直位置, 公司链接元素, 公司标题文本, 公司链接)
-                page_data.append((top_pos, title_el, title_value, href_value))
-
-            # 按垂直位置从小到大排序，确保抓取顺序与页面视觉顺序一致
-            page_data.sort(key=lambda x: x[0])
-
-            # 当前页待抓取列表（若 MAX_FETCH_PER_PAGE>0 则只抓前 N 条，否则抓本页全部）
-            ordered_data = page_data[:MAX_FETCH_PER_PAGE] if MAX_FETCH_PER_PAGE else page_data
-            for _, title_el, title_value, href_value in ordered_data:
-                # 在打开新标签采集前，将当前这条商家记录滚动到搜索结果列表的可视区域中间，方便人工观察采集进度
-                try:
-                    if title_el:
-                        # 直接对当前这条“公司名称”链接元素执行滚动，block='center' 让其尽量出现在视口中间
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({behavior: 'auto', block: 'center'});",
-                            title_el
-                        )
-                except Exception:
-                    # 若元素已失效或滚动异常，不影响后续采集流程，直接忽略
-                    pass
-                # 记录当前店铺采集开始时间，用于控制单条最少耗时，防止抓取过快
-                shop_start_ts = time.time()
-                # print(f'正在采集: {title_value}')
-                try:
-                    href = (href_value or '').strip()
-                    is_redirect = (RESOLVE_REDIRECT_HOST in href) or (RESOLVE_REDIRECT_PATH in href)
-
-                    if not is_redirect:
-                        # 非跳转链接：直接在新标签打开联系页，避免先打开店铺首页再跳转，减少弹窗次数
-                        shop_origin = getShopOrigin(href)
-                        dedup_key = (shop_origin or href) or title_value
-                        if dedup_key in seen_shops:
-                            print(f'  跳过重复店铺（已采集）: {title_value}')
-                            continue
-                        if not shop_origin:
-                            print(f'  无法解析店铺域名，跳过')
-                            continue
-                        contact_url = shop_origin.rstrip('/') + '/page/contactinfo.htm'
-                        driver.execute_script("window.open(arguments[0], '_blank');", contact_url)
-                        driver.switch_to.window(driver.window_handles[-1])
-                        seen_shops.add(dedup_key)
-                        closeKnownPopups(driver)
-                    else:
-                        # 跳转链接：必须先在新标签打开一次以解析真实 URL，再打开联系页
-                        driver.execute_script("window.open(arguments[0], '_blank');", href)
-                        driver.switch_to.window(driver.window_handles[-1])
-                        closeKnownPopups(driver)
-                        # 新标签已打开跳转链接并完成重定向，直接从当前 URL 解析店铺域名，避免再次 get 触发弹窗
-                        shop_origin = getShopOrigin((driver.current_url or '').strip())
-                        dedup_key = (shop_origin or href) or title_value
-                        if dedup_key in seen_shops:
-                            print(f'  跳过重复店铺（已采集）: {title_value}')
-                            time.sleep(random.uniform(2, 3))
-                            driver.close()
-                            driver.switch_to.window(main_window)
-                            continue
-                        if not shop_origin:
-                            print(f'  无法解析店铺域名，跳过')
-                            time.sleep(random.uniform(2, 3))
-                            driver.close()
-                            driver.switch_to.window(main_window)
-                            continue
-                        contact_url = shop_origin.rstrip('/') + '/page/contactinfo.htm'
-                        driver.get(contact_url)
-                        closeKnownPopups(driver)
-                        seen_shops.add(dedup_key)
-
-                    # 若未真正进入联系页（被重定向到首页/验证等），用当前页域名再试一次联系页
-                    current_url = (driver.current_url or '').strip()
-                    if 'contactinfo' not in current_url and '.1688.com' in current_url:
-                        retry_origin = getShopOrigin(current_url)
-                        if retry_origin:
-                            retry_contact = retry_origin.rstrip('/') + '/page/contactinfo.htm'
-                            driver.get(retry_contact)
-                        closeKnownPopups(driver)
-
-                    # 仍未在联系页时提示，便于排查
-                    if 'contactinfo' not in (driver.current_url or ''):
-                        print(f'  ⚠ 未进入联系方式页，当前: {(driver.current_url or "")[:80]}')
-
-                    # 等待联系方式页内容渲染完成：
-                    # 1688 联系页数据为异步加载，仅等待 <body> 出现远远不够，需等待关键 DOM 元素或文本
-                    try:
-                        contact_wait = WebDriverWait(driver, 15, poll_frequency=1)
-                        contact_wait.until(lambda d: any(
-                            kw in (d.find_element(By.TAG_NAME, 'body').text or '')
-                            for kw in ['电话', '手机', '地址', '联系人', '传真']
-                        ))
-                    except Exception:
-                        # 超时后仍继续尝试提取，有可能页面确实无联系信息
-                        time.sleep(3)
-                    # 获取渲染后的页面文本
-                    page_text = driver.find_element(By.TAG_NAME, 'body').text
-
-                    # 检查是否出现验证码，使用封装的显式等待函数等待滑块验证消失
-                    resolved, waited_seconds = waitCaptchaResolved(driver)
-                    if not resolved:
-                        print(f'  验证码等待超时，跳过该商家')
-                        try:
-                            time.sleep(random.uniform(2, 3))
-                            driver.close()
-                            driver.switch_to.window(main_window)
-                        except Exception:
-                            pass
-                        continue
-                    # 若确实经历过滑块验证，提示一次，并在验证通过后重新获取页面文本
-                    if waited_seconds > 0:
-                        print(f'  验证通过，刷新页面重新获取联系数据...')
-                        try:
-                            driver.refresh()
-                            WebDriverWait(driver, 10).until(
-                                EC.presence_of_element_located((By.TAG_NAME, 'body'))
-                            )
-                            page_text = driver.find_element(By.TAG_NAME, 'body').text
-                        except Exception:
-                            page_text = page_text
-
-                    # 先尝试从 DOM 提取联系人、电话、手机、传真、地址，再用正则兜底
-                    member_name, tel, mobile, fax, address = extractContactByDom(driver)
-                    if not member_name or not tel or not mobile or not fax or not address:
-                        r_name, r_tel, r_mobile, r_fax, r_addr = extractContactByRegex(page_text)
-                        if not member_name:
-                            member_name = r_name
-                        if not tel:
-                            tel = r_tel
-                        if not mobile:
-                            mobile = r_mobile
-                        if not fax:
-                            fax = r_fax
-                        if not address:
-                            address = r_addr
-
-                    # 清洗地址：去掉误抓的「技术支持:旺铺管理」等后缀
-                    address = cleanAddress(address or '')
-
-                    address_preview = (address or '')[:30]
-                    # print(f'  联系人: {member_name or "(无)"} | 电话: {tel or "(无)"} | 手机: {mobile or "(无)"} | 传真: {fax or "(无)"} | 地址: {address_preview or "(无)"}')
-                    # 仅在有手机号时才写入 Excel（表头：企业名称、当前城市、联系方式、联系人、手机、地址）
-                    mobile_stripped = (mobile or '').strip()
-                    if mobile_stripped:
-                        current_city_for_excel = current_city or (TARGET_REGION or '全国')
-                        row_data = (
-                            title_value,
-                            current_keyword,
-                            current_city_for_excel,
-                            contact_url,
-                            member_name or '',
-                            mobile_stripped,
-                            address or '',
-                        )
-                        for col, val in enumerate(row_data, start=1):
-                            ws.cell(row=excel_row, column=col, value=val)
-                        excel_row += 1
-                        wb.save(OUTPUT_EXCEL)
-
-                        # 更新全局已采集数量，并根据 TOTAL_MAX_SHOPS 判断是否需要提前结束本次采集
-                        total_shops_collected += 1
-                        # 每次成功写入一条数据后，打印当前已写入的总数量，方便观察采集进度（立即刷新输出）
-                        print(f'  本次 Excel 已累计写入 {total_shops_collected} 条数据', flush=True)
-                        if TOTAL_MAX_SHOPS > 0 and total_shops_collected >= TOTAL_MAX_SHOPS:
-                            print(f'本次已采集商家数量达到上限 {TOTAL_MAX_SHOPS}，停止后续采集')
-                            stop_collecting = True
-
-                        # 根据开始时间计算本条已耗时，不足目标时长则额外等待一段时间，避免访问过快触发风控
-                        elapsed = time.time() - shop_start_ts
-                        target_seconds = MIN_SECONDS_PER_SHOP + random.uniform(-2, 2)
-                        if target_seconds < MIN_SECONDS_PER_SHOP * 0.8:
-                            target_seconds = MIN_SECONDS_PER_SHOP * 0.8
-                        extra_sleep = max(0, target_seconds - elapsed)
-                        if extra_sleep > 0:
-                            time.sleep(extra_sleep)
-                    else:
-                        print('  无手机号，跳过写入 Excel')
-                        time.sleep(random.uniform(3, 6))
-                    # 关闭联系方式页标签，切回主标签（搜索结果页），继续本页下一个或翻页
-                    driver.close()
-                    driver.switch_to.window(main_window)
-
-                except Exception as e:
-                    print(f'  采集失败: {e}')
-                    try:
-                        time.sleep(random.uniform(2, 3))
-                        if driver.current_window_handle != main_window:
-                            driver.close()
-                        driver.switch_to.window(main_window)
+                        self.driver.switch_to.default_content()
                     except Exception:
                         pass
-                    continue
-            # 主标签仍在搜索结果页：先判断是否有下一页，没有则直接结束当前城市的采集
-            page_elements = driver.find_elements(By.CSS_SELECTOR, "a.fui-next")
-            if not page_elements:
-                print(f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」没有下一页，结束该任务')
-                break
-            next_btn = page_elements[0]
-            # 检查“下一页”按钮是否处于禁用状态（已是最后一页）
+        except Exception:
+            pass
+        return False
+
+    def _humanLikeDrag(self, slider_el, distance: int):
+        """模拟人类拖拽滑块：先加速后减速，带随机抖动。"""
+        action = ActionChains(self.driver)
+        action.move_to_element(slider_el)
+        action.pause(random.uniform(0.3, 0.6))
+        action.click_and_hold(slider_el)
+        action.pause(random.uniform(0.1, 0.25))
+
+        for dx, dy, dt_ms in self._generateHumanTrack(distance):
+            action.move_by_offset(dx, dy)
+            action.pause(dt_ms / 1000.0)
+
+        action.pause(random.uniform(0.3, 0.8))
+        action.release()
+        action.perform()
+
+    @staticmethod
+    def _generateHumanTrack(distance: int) -> list[tuple[int, int, int]]:
+        """生成模拟人类拖拽的轨迹点列表（先加速后减速，带随机抖动）。"""
+        tracks: list[tuple[int, int, int]] = []
+        current = 0
+        accel_end = distance * 0.7
+
+        # 加速段
+        t = 0.0
+        while current < accel_end:
+            t += random.uniform(0.02, 0.04)
+            progress = min(t / 0.5, 1.0)
+            step = max(1, int(random.uniform(2, 6) * (1 + progress * 2)))
+            if current + step > accel_end:
+                step = max(1, int(accel_end - current))
+            dy = random.choice([-1, 0, 0, 0, 1])
+            dt = random.randint(SLIDER_STEP_MIN_MS, SLIDER_STEP_MAX_MS)
+            tracks.append((step, dy, dt))
+            current += step
+
+        # 减速段
+        remaining = distance - current
+        while remaining > 0:
+            step = max(1, int(remaining * random.uniform(0.15, 0.4)))
+            if step > remaining:
+                step = max(1, int(remaining))
+            dy = random.choice([0, 0, 0, -1, 1])
+            dt = random.randint(SLIDER_STEP_MAX_MS, SLIDER_STEP_MAX_MS * 3)
+            tracks.append((step, dy, dt))
+            remaining -= step
+
+        return tracks
+
+    # ── 页面滚动 ─────────────────────────────────────────
+
+    def _scrollToBottom(self):
+        """将页面滚动到底部。"""
+        try:
+            self.driver.execute_script(
+                "window.scrollTo({top: document.body.scrollHeight, behavior: 'auto'});"
+            )
+        except Exception:
             try:
-                next_class = (next_btn.get_attribute('class') or '').lower()
-                aria_disabled = (next_btn.get_attribute('aria-disabled') or '').lower()
-                if 'disabled' in next_class or 'fui-next-disabled' in next_class or aria_disabled == 'true':
-                    print(f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」已是最后一页，结束该任务')
-                    break
+                self.driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
             except Exception:
                 pass
-            # 有下一页时才滚动并点击下一页，翻页前后加入随机等待以降低风控触发概率
-            time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
-            scrollToBottom(driver)
-            time.sleep(random.uniform(2, 4))
+
+    def _scrollToLoadAllResults(self):
+        """渐进式滚动页面，触发 1688 搜索结果的懒加载。"""
+        try:
+            self.driver.execute_script('window.scrollTo(0, 0);')
+            time.sleep(0.3)
+
+            total_height = self.driver.execute_script('return document.body.scrollHeight;')
+            current_pos = 0
+
+            while current_pos < total_height:
+                current_pos += SCROLL_STEP_PX
+                self.driver.execute_script(f'window.scrollTo(0, {current_pos});')
+                time.sleep(SCROLL_STEP_WAIT)
+
+                try:
+                    loaded = len(self.driver.find_elements(By.CSS_SELECTOR, 'a.company-name'))
+                    if loaded >= EXPECTED_ITEMS_PER_PAGE:
+                        break
+                except Exception:
+                    pass
+
+                try:
+                    total_height = self.driver.execute_script('return document.body.scrollHeight;')
+                except Exception:
+                    pass
+
+            self._scrollToBottom()
+            time.sleep(SCROLL_FINAL_WAIT)
+            self.driver.execute_script('window.scrollTo(0, 0);')
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    def _scrollToElement(self, element):
+        """将指定元素滚动到视口中间，便于观察采集进度。"""
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'auto', block: 'center'});",
+                element,
+            )
+        except Exception:
+            pass
+
+    # ── 工具方法 ─────────────────────────────────────────
+
+    def _findBySelectors(self, selectors: list[str]):
+        """按优先级依次尝试 CSS 选择器列表，返回第一个可见元素或 None。"""
+        for sel in selectors:
             try:
-                closeKnownPopups(driver)
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed() and el.size.get('width', 0) > 0:
+                        return el
             except Exception:
-                pass
-            driver.execute_script("arguments[0].click();", next_btn)
-            time.sleep(random.uniform(PAGE_TURN_WAIT_MIN, PAGE_TURN_WAIT_MAX))
-            page_num += 1
-        except Exception as e:
-            print('error:', e)
-            page_error_count += 1
-            # 若连续页面级异常次数超过上限，则主动中止当前城市的循环，避免极端情况下无限重试
-            if page_error_count >= MAX_PAGE_ERRORS:
-                print(f'关键词「{current_keyword}」城市「{current_city or "整省/全国"}」页面级异常次数已达到上限 {MAX_PAGE_ERRORS} 次，停止该任务')
-                break
-            continue
+                continue
+        return None
 
-    # 若已达到全局采集上限，则不再进入后续任务循环
-    if TOTAL_MAX_SHOPS > 0 and total_shops_collected >= TOTAL_MAX_SHOPS:
-        break
+    def _closeTabAndReturn(self, main_window: str):
+        """关闭当前标签并切回主窗口。"""
+        try:
+            time.sleep(random.uniform(2, 3))
+            self.driver.close()
+            self.driver.switch_to.window(main_window)
+        except Exception:
+            pass
 
-# 所有任务采集完成或达到上限后：保存数据并关闭浏览器
-try:
-    wb.save(OUTPUT_EXCEL)
-except Exception as e:
-    print(f'保存 Excel 时出错: {e}')
-print(f'采集完成！数据已保存到 {OUTPUT_EXCEL}', flush=True)
-# 采集结束后，打印本次写入 Excel 的数据总条数，便于确认结果数量（立即刷新输出）
-print(f'本次共向 Excel 写入 {total_shops_collected} 条数据', flush=True)
-try:
-    driver.quit()
-except Exception:
-    pass
+    def _safeCloseAndReturn(self, main_window: str):
+        """安全关闭非主窗口标签并切回主窗口（异常恢复用）。"""
+        try:
+            time.sleep(random.uniform(2, 3))
+            if self.driver.current_window_handle != main_window:
+                self.driver.close()
+            self.driver.switch_to.window(main_window)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════
+#  入口
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    """脚本主入口：加载配置 → 用户交互 → 登录 → 采集。"""
+    config = loadRuntimeConfig()
+    config = collectUserInput(config)
+
+    with AlibabaScraper(config) as scraper:
+        scraper.login()
+        scraper.run()
+
+
+if __name__ == '__main__':
+    freeze_support()
+    main()
