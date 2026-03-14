@@ -83,23 +83,23 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
 # ── 节奏控制（反爬：随机化、冷却）────────────────────────
-MIN_SECONDS_PER_SHOP = 18           # 单条采集最小间隔（秒），降低触发「操作太频繁」
-MIN_SECONDS_PER_SHOP_JITTER = 4     # 单条采集耗时在 MIN ± JITTER 内随机
-PAGE_TURN_WAIT_MIN = 5
-PAGE_TURN_WAIT_MAX = 12
+MIN_SECONDS_PER_SHOP = 15          # 单条采集最小间隔（秒），降低触发「操作太频繁」
+MIN_SECONDS_PER_SHOP_JITTER = 5     # 单条采集耗时在 MIN ± JITTER 内随机
+PAGE_TURN_WAIT_MIN = 4
+PAGE_TURN_WAIT_MAX = 8
 # 任务切换：每个新任务开始前随机等待，避免连续请求
-TASK_START_DELAY_MIN = 4
-TASK_START_DELAY_MAX = 10
+TASK_START_DELAY_MIN = 3
+TASK_START_DELAY_MAX = 7
 # 打开新页面/新标签后等待，模拟用户阅读
 PAGE_OPEN_DELAY_MIN = 2
 PAGE_OPEN_DELAY_MAX = 5
 # 无手机号时仍保持一定间隔，避免空结果也高频请求
 SHOP_NO_MOBILE_WAIT_MIN = 5
-SHOP_NO_MOBILE_WAIT_MAX = 10
+SHOP_NO_MOBILE_WAIT_MAX = 8
 # 每采集 N 个商家后休息一段时间，降低连续请求特征
-REST_EVERY_N_SHOPS = 5              # 更频繁休息，降低风控触发
-REST_DURATION_MIN = 40
-REST_DURATION_MAX = 70
+REST_EVERY_N_SHOPS = 10              # 更频繁休息，降低风控触发
+REST_DURATION_MIN = 30
+REST_DURATION_MAX = 50
 # 访问被拒/验证码通过后的“恢复期”额外等待
 RECOVERY_AFTER_DENIED_EXTRA_MIN = 5
 RECOVERY_AFTER_DENIED_EXTRA_MAX = 12
