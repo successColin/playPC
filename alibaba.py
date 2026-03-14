@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import io
 import random
 import re
@@ -15,7 +16,7 @@ from multiprocessing import freeze_support
 from typing import Optional
 from urllib.parse import quote, urlparse
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -82,23 +83,23 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
 # ── 节奏控制（反爬：随机化、冷却）────────────────────────
-MIN_SECONDS_PER_SHOP = 15
-MIN_SECONDS_PER_SHOP_JITTER = 2  # 单条采集耗时在 MIN ± JITTER 内随机
-PAGE_TURN_WAIT_MIN = 3
-PAGE_TURN_WAIT_MAX = 7
+MIN_SECONDS_PER_SHOP = 22           # 单条采集最小间隔（秒），降低触发「操作太频繁」
+MIN_SECONDS_PER_SHOP_JITTER = 3     # 单条采集耗时在 MIN ± JITTER 内随机
+PAGE_TURN_WAIT_MIN = 5
+PAGE_TURN_WAIT_MAX = 12
 # 任务切换：每个新任务开始前随机等待，避免连续请求
-TASK_START_DELAY_MIN = 2
-TASK_START_DELAY_MAX = 6
+TASK_START_DELAY_MIN = 4
+TASK_START_DELAY_MAX = 10
 # 打开新页面/新标签后等待，模拟用户阅读
-PAGE_OPEN_DELAY_MIN = 1
-PAGE_OPEN_DELAY_MAX = 3
+PAGE_OPEN_DELAY_MIN = 2
+PAGE_OPEN_DELAY_MAX = 5
 # 无手机号时仍保持一定间隔，避免空结果也高频请求
-SHOP_NO_MOBILE_WAIT_MIN = 3
-SHOP_NO_MOBILE_WAIT_MAX = 6
+SHOP_NO_MOBILE_WAIT_MIN = 5
+SHOP_NO_MOBILE_WAIT_MAX = 10
 # 每采集 N 个商家后休息一段时间，降低连续请求特征
-REST_EVERY_N_SHOPS = 8
-REST_DURATION_MIN = 25
-REST_DURATION_MAX = 45
+REST_EVERY_N_SHOPS = 5              # 更频繁休息，降低风控触发
+REST_DURATION_MIN = 40
+REST_DURATION_MAX = 70
 # 访问被拒/验证码通过后的“恢复期”额外等待
 RECOVERY_AFTER_DENIED_EXTRA_MIN = 5
 RECOVERY_AFTER_DENIED_EXTRA_MAX = 12
@@ -119,9 +120,15 @@ JS_REMOVE_BAXIA_DIALOG = (
     "if(d&&!c)d.remove();"
 )
 TEXT_ACCESS_DENIED = '访问被拒绝'
+TEXT_OPERATION_TOO_FREQUENT = '操作太频繁'  # 1688 风控：请求过于频繁时的提示
 MAX_ACCESS_DENIED_CLOSE_ATTEMPTS = 3
 ACCESS_DENIED_COOLDOWN_MIN = 15
 ACCESS_DENIED_COOLDOWN_MAX = 30
+# 「操作太频繁」专用：需长冷却，切勿立即重试滑块
+OPERATION_TOO_FREQUENT_COOLDOWN_MIN = 90   # 至少等待 1.5 分钟
+OPERATION_TOO_FREQUENT_COOLDOWN_MAX = 180  # 最多等待 3 分钟
+OPERATION_TOO_FREQUENT_RECOVERY_EXTRA_MIN = 45  # 冷却后额外恢复期
+OPERATION_TOO_FREQUENT_RECOVERY_EXTRA_MAX = 90
 
 # ── 滑块自动拖拽相关常量 ──────────────────────────────────
 SLIDER_BTN_SELECTORS = [
@@ -234,26 +241,21 @@ def buildSearchUrl(keyword: str, province_name: str, city_name: str) -> str:
 
 def buildOutputFileName(config: ScraperConfig) -> str:
     """
-    根据当前日期时间、搜索关键词和地区构造导出 Excel 文件名。
-    格式：YYYYMMDD_HHMMSS_搜索内容_地区.xlsx
+    根据地区与城市构造导出 Excel 文件名（不含日期时间）。
+    格式：地区_城市.xlsx，固定文件名便于每次抓取追加到同一文件。
     """
-    MAX_SHOW_KEYWORDS = 3
     try:
-        now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         region_desc = config.target_region or '全国'
-
-        if config.keywords:
-            shown = '+'.join(config.keywords[:MAX_SHOW_KEYWORDS])
-            if len(config.keywords) > MAX_SHOW_KEYWORDS:
-                keywords_part = f'{shown}等{len(config.keywords)}个'
-            else:
-                keywords_part = shown
+        cities = config.province_city_map.get(config.target_region or '', [])
+        if len(cities) == 1:
+            city_desc = cities[0]
+        elif len(cities) > 1:
+            city_desc = f'{cities[0]}等{len(cities)}城'
         else:
-            keywords_part = '未命名'
-
-        return f'{now_str}_{keywords_part.replace(" ", "")}_{region_desc}.xlsx'
+            city_desc = '整省' if config.target_region else '全国'
+        return f'{region_desc}_{city_desc}.xlsx'
     except Exception:
-        return f'{OUTPUT_EXCEL_PREFIX}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        return f'{OUTPUT_EXCEL_PREFIX}.xlsx'
 
 
 def extractContactByRegex(page_text: str) -> tuple[str, str, str, str, str]:
@@ -516,8 +518,20 @@ class AlibabaScraper:
             raise RuntimeError(f'所有浏览器均不可用: {e_ff}') from e_ff
 
     def _initExcel(self):
-        """创建 Excel 工作簿并写入表头。"""
+        """
+        初始化 Excel：若目标文件已存在则加载并追加；否则创建新文件并写入表头。
+        每次抓取均追加到同一文件，不覆盖历史数据。
+        """
         self.output_file = buildOutputFileName(self.config)
+        if os.path.isfile(self.output_file):
+            try:
+                self.wb = load_workbook(self.output_file)
+                self.ws = self.wb.active
+                # 表头在第 1 行，从第 2 行开始追加
+                self.excel_row = self.ws.max_row + 1
+                return
+            except Exception as e:
+                print(f'加载已有 Excel 失败 ({e})，将创建新文件')
         self.wb = Workbook()
         self.ws = self.wb.active
         self.ws.title = '采集数据'
@@ -741,6 +755,9 @@ class AlibabaScraper:
         city_desc = city or '整省/全国'
         self._maybeRecoveryWait()
         self._closeKnownPopups()
+        # 优先处理「操作太频繁」：需长冷却，不当作普通验证码
+        if self._handleOperationTooFrequent():
+            return True  # 冷却完成，继续当前页处理
         if self._closeAccessDeniedPopup():
             print('检测到「访问被拒绝」弹窗，已尝试关闭')
 
@@ -1225,6 +1242,67 @@ class AlibabaScraper:
         except Exception:
             pass
 
+    def _detectOperationTooFrequent(self) -> bool:
+        """检测页面是否出现「操作太频繁」风控提示。"""
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, 'body').text or ''
+            if TEXT_OPERATION_TOO_FREQUENT in body_text:
+                return True
+            for el in self.driver.find_elements(By.CSS_SELECTOR, '.baxia-dialog, [class*="dialog"], [class*="modal"]'):
+                text = (el.text or '').strip()
+                if TEXT_OPERATION_TOO_FREQUENT in text:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _handleOperationTooFrequent(self) -> bool:
+        """
+        检测并处理「操作太频繁」弹窗：不尝试自动滑块，直接长冷却。
+        关闭弹窗后等待 90~180 秒，并设置额外恢复期。返回 True 表示曾检测并处理。
+        """
+        if not self._detectOperationTooFrequent():
+            return False
+
+        print('检测到「操作太频繁」，进入长冷却（不尝试滑块，等待 1.5~3 分钟）...')
+        # 尝试点击刷新或关闭按钮，让用户可手动刷新
+        try:
+            refresh_btns = self.driver.find_elements(
+                By.XPATH,
+                "//*[contains(@class,'refresh') or contains(@class,'reload') or "
+                "contains(text(),'刷新') or contains(@title,'刷新')]"
+            )
+            for btn in refresh_btns[:1]:
+                try:
+                    if btn.is_displayed():
+                        self.driver.execute_script('arguments[0].click();', btn)
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        cooldown = random.uniform(
+            OPERATION_TOO_FREQUENT_COOLDOWN_MIN,
+            OPERATION_TOO_FREQUENT_COOLDOWN_MAX
+        )
+        print(f'冷却等待 {cooldown:.0f} 秒后继续...')
+        time.sleep(cooldown)
+
+        # 设置恢复期，后续几次请求也放缓
+        self._recovery_until = time.time() + random.uniform(
+            OPERATION_TOO_FREQUENT_RECOVERY_EXTRA_MIN,
+            OPERATION_TOO_FREQUENT_RECOVERY_EXTRA_MAX
+        )
+        # 冷却后刷新当前页，获取新状态
+        try:
+            self.driver.refresh()
+            randomDelay(PAGE_OPEN_DELAY_MIN + 2, PAGE_OPEN_DELAY_MAX + 4)
+        except Exception:
+            pass
+        print('冷却完成，已刷新页面并设置恢复期。')
+        return True
+
     def _closeAccessDeniedPopup(self) -> bool:
         """
         检测并尝试关闭「亲，访问被拒绝」弹窗。
@@ -1306,9 +1384,11 @@ class AlibabaScraper:
     def _waitCaptchaResolved(self) -> tuple[bool, int]:
         """
         检测并尝试自动解决滑块验证码，失败后等待手动操作。
-        返回 (是否通过, 等待秒数)。
+        「操作太频繁」时不做滑块，直接长冷却。返回 (是否通过, 等待秒数)。
         """
         start = time.time()
+        if self._handleOperationTooFrequent():
+            return True, int(time.time() - start)
         if not self._detectCaptcha():
             return True, 0
 
