@@ -83,8 +83,8 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
 # ── 节奏控制（反爬：随机化、冷却）────────────────────────
-MIN_SECONDS_PER_SHOP = 22           # 单条采集最小间隔（秒），降低触发「操作太频繁」
-MIN_SECONDS_PER_SHOP_JITTER = 3     # 单条采集耗时在 MIN ± JITTER 内随机
+MIN_SECONDS_PER_SHOP = 18           # 单条采集最小间隔（秒），降低触发「操作太频繁」
+MIN_SECONDS_PER_SHOP_JITTER = 4     # 单条采集耗时在 MIN ± JITTER 内随机
 PAGE_TURN_WAIT_MIN = 5
 PAGE_TURN_WAIT_MAX = 12
 # 任务切换：每个新任务开始前随机等待，避免连续请求
