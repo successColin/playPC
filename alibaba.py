@@ -83,7 +83,7 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
 # ── 节奏控制（反爬：随机化、冷却）────────────────────────
-MIN_SECONDS_PER_SHOP = 15          # 单条采集最小间隔（秒），降低触发「操作太频繁」
+MIN_SECONDS_PER_SHOP = 20          # 单条采集最小间隔（秒），降低触发「操作太频繁」
 MIN_SECONDS_PER_SHOP_JITTER = 5     # 单条采集耗时在 MIN ± JITTER 内随机
 PAGE_TURN_WAIT_MIN = 4
 PAGE_TURN_WAIT_MAX = 8
@@ -99,6 +99,8 @@ SHOP_NO_MOBILE_WAIT_MAX = 8
 # 每采集 N 个商家后休息一段时间，降低连续请求特征
 REST_EVERY_N_SHOPS = 10              # 更频繁休息，降低风控触发
 REST_DURATION_MIN = 30
+# Excel 阶段性保存：每采集 N 条后保存一次，避免每条都保存导致文件锁冲突
+SAVE_INTERVAL_RECORDS = 50
 REST_DURATION_MAX = 50
 # 访问被拒/验证码通过后的“恢复期”额外等待
 RECOVERY_AFTER_DENIED_EXTRA_MIN = 5
@@ -899,6 +901,13 @@ class AlibabaScraper:
                 self._writeToExcel(title_value, keyword, city, contact_url, contact)
                 self.total_collected += 1
                 print(f'已累计写入 {self.total_collected} 条数据', flush=True)
+                # 阶段性保存：每 N 条保存一次，减少文件 I/O 和锁冲突
+                if SAVE_INTERVAL_RECORDS > 0 and self.total_collected % SAVE_INTERVAL_RECORDS == 0:
+                    try:
+                        self.wb.save(self.output_file)
+                        print(f'✓ 数据已阶段性保存到 {self.output_file}', flush=True)
+                    except Exception as e:
+                        print(f'✗ 阶段性保存 Excel 失败: {e}，请确保文件未被 WPS/Excel 等占用', flush=True)
                 self._checkCollectLimit()
                 # 反爬：每采集 N 个商家后休息一段时间
                 if REST_EVERY_N_SHOPS > 0 and self.total_collected % REST_EVERY_N_SHOPS == 0:
@@ -1008,7 +1017,7 @@ class AlibabaScraper:
         self, title: str, keyword: str, city: str,
         contact_url: str, contact: dict[str, str],
     ):
-        """将一条商家记录写入 Excel 并即时保存。"""
+        """将一条商家记录写入 Excel（仅写入单元格，由阶段保存与 close 负责落盘）。"""
         city_for_excel = city or (self.config.target_region or '全国')
         row_data = (
             title,
@@ -1022,7 +1031,6 @@ class AlibabaScraper:
         for col, val in enumerate(row_data, start=1):
             self.ws.cell(row=self.excel_row, column=col, value=val)
         self.excel_row += 1
-        self.wb.save(self.output_file)
 
     def _checkCollectLimit(self):
         """检查是否达到本次运行的采集上限。"""
