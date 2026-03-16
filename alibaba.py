@@ -83,7 +83,7 @@ DEFAULT_MAX_PAGE_ERRORS = 10
 DEFAULT_TOTAL_MAX_SHOPS = 0
 
 # ── 节奏控制（反爬：随机化、冷却）────────────────────────
-MIN_SECONDS_PER_SHOP = 20          # 单条采集最小间隔（秒），降低触发「操作太频繁」
+MIN_SECONDS_PER_SHOP = 18          # 单条采集最小间隔（秒），降低触发「操作太频繁」
 MIN_SECONDS_PER_SHOP_JITTER = 5     # 单条采集耗时在 MIN ± JITTER 内随机
 PAGE_TURN_WAIT_MIN = 4
 PAGE_TURN_WAIT_MAX = 8
@@ -95,7 +95,7 @@ PAGE_OPEN_DELAY_MIN = 2
 PAGE_OPEN_DELAY_MAX = 5
 # 无手机号时仍保持一定间隔，避免空结果也高频请求
 SHOP_NO_MOBILE_WAIT_MIN = 5
-SHOP_NO_MOBILE_WAIT_MAX = 8
+SHOP_NO_MOBILE_WAIT_MAX = 10
 # 每采集 N 个商家后休息一段时间，降低连续请求特征
 REST_EVERY_N_SHOPS = 10              # 更频繁休息，降低风控触发
 REST_DURATION_MIN = 30
